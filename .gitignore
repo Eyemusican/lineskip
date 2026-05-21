@@ -43,3 +43,20 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+
+
+# Firebase credentials
+lib/firebase_options.dart
+google-services.json
+GoogleService-Info.plist
+.firebase/
+firebase.json
+.firebaserc
+
+# Claude Code
+.claude/
+
+# Environment
+.env
+*.env
