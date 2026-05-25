@@ -1,9 +1,22 @@
+import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../models/hospital.dart';
 import '../services/firestore_service.dart';
+import '../services/queue_notification_service.dart';
+
+const _primaryBlue = Color(0xFF4F6BED);
+const _bgColor = Color(0xFFFAFBFD);
+const _textPrimary = Color(0xFF1F2937);
+const _textSecondary = Color(0xFF9CA3AF);
+const _borderColor = Color(0xFFE5E7EB);
+const _selectedBg = Color(0xFFEEF2FF);
+const _successGreen = Color(0xFF10B981);
+
+// Maximum bookings allowed per session
+const _sessionCapacity = 50;
 
 class TokenBookingScreen extends StatefulWidget {
   final Hospital hospital;
@@ -18,16 +31,13 @@ class _TimeSlot {
   final String label;
   final String range;
   final IconData icon;
-  final int spotsLeft;
   final bool isLunchBreak;
-  // Hour (24h) after which this slot is considered closed. 0 = not applicable.
   final int closeAfterHour;
 
   const _TimeSlot({
     required this.label,
     required this.range,
     required this.icon,
-    required this.spotsLeft,
     this.isLunchBreak = false,
     this.closeAfterHour = 0,
   });
@@ -36,28 +46,34 @@ class _TimeSlot {
 class _TokenBookingScreenState extends State<TokenBookingScreen>
     with SingleTickerProviderStateMixin {
   int _selectedSlot = -1;
+  bool _saving = false;
   late AnimationController _shimmerController;
+
+  // Live session booked counts from Firestore
+  Map<String, int> _sessionBookedCounts = {};
+  StreamSubscription<Map<String, int>>? _countsSubscription;
+
+  // Live active queue count for this hospital today
+  int _activeCount = 0;
+  StreamSubscription<int>? _activeCountSubscription;
 
   final List<_TimeSlot> _slots = const [
     _TimeSlot(
       label: 'Morning Session',
       range: '9:00 AM – 1:00 PM',
-      icon: Icons.wb_sunny_rounded,
-      spotsLeft: 8,
+      icon: Icons.wb_sunny_outlined,
       closeAfterHour: 13,
     ),
     _TimeSlot(
       label: 'Lunch Break',
       range: '1:00 PM – 2:00 PM',
-      icon: Icons.restaurant_rounded,
-      spotsLeft: 0,
+      icon: Icons.coffee_outlined,
       isLunchBreak: true,
     ),
     _TimeSlot(
       label: 'Afternoon Session',
       range: '2:00 PM – 5:00 PM',
-      icon: Icons.wb_cloudy_rounded,
-      spotsLeft: 14,
+      icon: Icons.wb_cloudy_outlined,
       closeAfterHour: 17,
     ),
   ];
@@ -65,14 +81,34 @@ class _TokenBookingScreenState extends State<TokenBookingScreen>
   bool _isDisabled(int i) {
     final slot = _slots[i];
     if (slot.isLunchBreak) return true;
-    if (slot.closeAfterHour == 0) return false;
-    return DateTime.now().hour >= slot.closeAfterHour;
+    if (slot.closeAfterHour > 0 && DateTime.now().hour >= slot.closeAfterHour) {
+      return true;
+    }
+    final booked = _sessionBookedCounts[slot.label] ?? 0;
+    return booked >= _sessionCapacity;
   }
 
   String _slotStatus(int i) {
     final slot = _slots[i];
     if (slot.isLunchBreak) return 'Break';
-    return _isDisabled(i) ? 'Closed' : 'Open';
+    if (slot.closeAfterHour > 0 && DateTime.now().hour >= slot.closeAfterHour) {
+      return 'Closed';
+    }
+    final booked = _sessionBookedCounts[slot.label] ?? 0;
+    if (booked >= _sessionCapacity) return 'Full';
+    return 'Open';
+  }
+
+  int _spotsLeft(int i) {
+    final slot = _slots[i];
+    if (slot.isLunchBreak) return 0;
+    final booked = _sessionBookedCounts[slot.label] ?? 0;
+    return max(0, _sessionCapacity - booked);
+  }
+
+  String _todayDateStr() {
+    final now = DateTime.now();
+    return '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
   }
 
   @override
@@ -82,47 +118,69 @@ class _TokenBookingScreenState extends State<TokenBookingScreen>
       vsync: this,
       duration: const Duration(seconds: 2),
     )..repeat(reverse: true);
+
+    final svc = FirestoreService();
+
+    _countsSubscription = svc
+        .getSessionTokenCounts(widget.hospital.id, _todayDateStr())
+        .listen((counts) {
+      if (mounted) setState(() => _sessionBookedCounts = counts);
+    });
+
+    _activeCountSubscription = svc
+        .getActiveTokenCountStream(widget.hospital.id)
+        .listen((count) {
+      if (mounted) setState(() => _activeCount = count);
+    });
   }
 
   @override
   void dispose() {
+    _countsSubscription?.cancel();
+    _activeCountSubscription?.cancel();
     _shimmerController.dispose();
     super.dispose();
   }
 
-  String _generateToken() {
-    final n = 40 + Random().nextInt(60);
-    return 'OPD-${n.toString().padLeft(3, '0')}';
-  }
-
-  void _onConfirm() {
-    if (_selectedSlot == -1) return;
+  Future<void> _onConfirm() async {
+    if (_selectedSlot == -1 || _saving) return;
     HapticFeedback.mediumImpact();
-    final token = _generateToken();
-    _saveTokenToFirestore(token);
-    _showSuccessSheet(token);
-  }
-
-  Future<void> _saveTokenToFirestore(String tokenNumber) async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
+    setState(() => _saving = true);
     try {
-      await FirestoreService().bookToken(
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) return;
+      final (tokenId, tokenNumber) = await FirestoreService().bookToken(
         userId: user.uid,
         hospitalId: widget.hospital.id,
         hospitalName: widget.hospital.name,
         hospitalShort: widget.hospital.shortName,
         session: _slots[_selectedSlot].label,
-        currentQueue: widget.hospital.currentQueue,
-        estimatedWaitMinutes: widget.hospital.estimatedWaitMinutes,
-        tokenNumber: tokenNumber,
+        minutesPerPatient: widget.hospital.estimatedWaitMinutes > 0
+            ? widget.hospital.estimatedWaitMinutes
+            : 5,
       );
+      // Start the global notification listener for the newly booked token.
+      QueueNotificationService.instance.attach(
+        tokenId: tokenId,
+        initialPeopleAhead: _activeCount,
+      );
+      if (mounted) _showSuccessSheet(tokenId, tokenNumber);
     } catch (e) {
-      debugPrint('Firestore bookToken error: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Booking failed. Please check your connection and try again.'),
+            backgroundColor: Color(0xFFEF4444),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
     }
   }
 
-  void _showSuccessSheet(String token) {
+  void _showSuccessSheet(String tokenId, String tokenNumber) {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
@@ -130,13 +188,15 @@ class _TokenBookingScreenState extends State<TokenBookingScreen>
       isDismissible: false,
       enableDrag: false,
       builder: (_) => _SuccessSheet(
-        token: token,
+        tokenId: tokenId,
+        token: tokenNumber,
         hospital: widget.hospital,
         slot: _slots[_selectedSlot],
+        peopleAhead: _activeCount,
         onDone: () {
           Navigator.of(context)
-            ..pop() // close sheet
-            ..pop(); // back to home
+            ..pop()
+            ..pop();
         },
       ),
     );
@@ -149,580 +209,485 @@ class _TokenBookingScreenState extends State<TokenBookingScreen>
     final bottomPad = MediaQuery.of(context).padding.bottom;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0D1B2A),
-      body: Stack(
+      backgroundColor: _bgColor,
+      body: Column(
         children: [
-          // Background glows
-          Positioned(
-            top: -60,
-            left: -60,
-            child: Container(
-              width: 220,
-              height: 220,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: RadialGradient(
-                  colors: [
-                    const Color(0xFF00E5C8).withOpacity(0.10),
-                    Colors.transparent,
+          // ── App bar ────────────────────────────────────────────────
+          Padding(
+            padding: EdgeInsets.fromLTRB(20, topPad + 16, 20, 0),
+            child: Row(
+              children: [
+                GestureDetector(
+                  onTap: () => Navigator.pop(context),
+                  child: Container(
+                    width: 34,
+                    height: 34,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(10),
+                      color: const Color(0xFFF3F4F6),
+                    ),
+                    child: const Icon(
+                      Icons.arrow_back_ios_new_rounded,
+                      color: _textPrimary,
+                      size: 15,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 14),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Book token',
+                      style: TextStyle(
+                        fontFamily: 'Poppins',
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                        color: _textPrimary,
+                      ),
+                    ),
+                    Text(
+                      '${hospital.shortName} • General OPD',
+                      style: const TextStyle(
+                        fontFamily: 'Poppins',
+                        fontSize: 11,
+                        color: _textSecondary,
+                      ),
+                    ),
                   ],
                 ),
-              ),
-            ),
-          ),
-          Positioned(
-            bottom: 160,
-            right: -80,
-            child: Container(
-              width: 200,
-              height: 200,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: RadialGradient(
-                  colors: [
-                    const Color(0xFF0057FF).withOpacity(0.07),
-                    Colors.transparent,
-                  ],
-                ),
-              ),
+              ],
             ),
           ),
 
-          Column(
-            children: [
-              // ── App bar ──────────────────────────────────────────
-              Padding(
-                padding: EdgeInsets.fromLTRB(20, topPad + 16, 20, 0),
-                child: Row(
-                  children: [
-                    GestureDetector(
-                      onTap: () => Navigator.pop(context),
-                      child: Container(
-                        width: 42,
-                        height: 42,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(13),
-                          color: const Color(0xFF152438),
-                          border: Border.all(
-                            color: const Color(0xFF1E3A52),
-                            width: 1,
+          const SizedBox(height: 20),
+
+          Expanded(
+            child: SingleChildScrollView(
+              physics: const BouncingScrollPhysics(),
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // ── Hospital info mini card ────────────────────────
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: _borderColor, width: 0.5),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 40,
+                          height: 40,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(11),
+                            color: _selectedBg,
+                          ),
+                          child: const Icon(
+                            Icons.local_hospital_outlined,
+                            color: _primaryBlue,
+                            size: 20,
                           ),
                         ),
-                        child: const Icon(
-                          Icons.arrow_back_ios_new_rounded,
-                          color: Colors.white,
-                          size: 16,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 16),
-                    Text(
-                      'Book OPD Token',
-                      style: TextStyle(fontFamily: 'Poppins',
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.white,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 24),
-
-              Expanded(
-                child: SingleChildScrollView(
-                  physics: const BouncingScrollPhysics(),
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // ── Hospital info card ───────────────────────
-                      Container(
-                        padding: const EdgeInsets.all(20),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(20),
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [
-                              const Color(0xFF152438),
-                              const Color(0xFF0F1E30),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                hospital.shortName,
+                                style: const TextStyle(
+                                  fontFamily: 'Poppins',
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w500,
+                                  color: _textPrimary,
+                                ),
+                              ),
+                              Text(
+                                hospital.location,
+                                style: const TextStyle(
+                                  fontFamily: 'Poppins',
+                                  fontSize: 11,
+                                  color: _textSecondary,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
                             ],
                           ),
-                          border: Border.all(
-                            color: const Color(0xFF1E3A52),
-                            width: 1,
-                          ),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.25),
-                              blurRadius: 14,
-                              offset: const Offset(0, 6),
-                            ),
-                          ],
                         ),
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 52,
-                              height: 52,
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(15),
-                                color:
-                                    const Color(0xFF00E5C8).withOpacity(0.12),
-                                border: Border.all(
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(6),
+                            color: hospital.isOpen
+                                ? _successGreen.withOpacity(0.1)
+                                : const Color(0xFFFEF2F2),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 5,
+                                height: 5,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: hospital.isOpen
+                                      ? _successGreen
+                                      : const Color(0xFFEF4444),
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                hospital.isOpen ? 'Open' : 'Closed',
+                                style: TextStyle(
+                                  fontFamily: 'Poppins',
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w500,
+                                  color: hospital.isOpen
+                                      ? _successGreen
+                                      : const Color(0xFFEF4444),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+
+                  // Live stats row
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _StatCard(
+                          icon: Icons.people_alt_outlined,
+                          label: 'In Queue',
+                          value: '$_activeCount',
+                          valueColor: _activeCount <= 10
+                              ? _successGreen
+                              : _activeCount <= 20
+                                  ? const Color(0xFFD97706)
+                                  : const Color(0xFFEF4444),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _StatCard(
+                          icon: Icons.schedule_outlined,
+                          label: 'Est. Wait',
+                          value:
+                              '~${_activeCount * (hospital.estimatedWaitMinutes > 0 ? hospital.estimatedWaitMinutes : 5)} min',
+                          valueColor: _textPrimary,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _StatCard(
+                          icon: Icons.calendar_today_outlined,
+                          label: 'Date',
+                          value: _todayLabel(),
+                          valueColor: _textPrimary,
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // ── Time slot section ──────────────────────────────
+                  const Text(
+                    'Select time slot',
+                    style: TextStyle(
+                      fontFamily: 'Poppins',
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      color: _textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Choose your preferred OPD session for today',
+                    style: TextStyle(
+                      fontFamily: 'Poppins',
+                      fontSize: 12,
+                      color: _textSecondary,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+
+                  ..._slots.asMap().entries.map((entry) {
+                    final i = entry.key;
+                    final slot = entry.value;
+                    final disabled = _isDisabled(i);
+                    final selected = !disabled && _selectedSlot == i;
+                    final status = _slotStatus(i);
+                    final spotsLeft = _spotsLeft(i);
+
+                    Color pillBg;
+                    Color pillText;
+                    if (slot.isLunchBreak) {
+                      pillBg = const Color(0xFFF3F4F6);
+                      pillText = _textSecondary;
+                    } else if (disabled) {
+                      pillBg = const Color(0xFFFEF2F2);
+                      pillText = const Color(0xFFEF4444);
+                    } else {
+                      pillBg = _successGreen.withOpacity(0.1);
+                      pillText = _successGreen;
+                    }
+
+                    return GestureDetector(
+                      onTap: disabled
+                          ? null
+                          : () => setState(() => _selectedSlot = i),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
+                        curve: Curves.easeOut,
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(14),
+                          color: selected
+                              ? _selectedBg
+                              : slot.isLunchBreak
+                                  ? const Color(0xFFF9FAFB)
+                                  : Colors.white,
+                          border: Border.all(
+                            color: selected ? _primaryBlue : _borderColor,
+                            width: selected ? 1.5 : 0.5,
+                          ),
+                        ),
+                        child: Opacity(
+                          opacity: disabled ? 0.55 : 1.0,
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 40,
+                                height: 40,
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(11),
+                                  color: selected
+                                      ? _primaryBlue.withOpacity(0.12)
+                                      : const Color(0xFFF3F4F6),
+                                ),
+                                child: Icon(
+                                  slot.icon,
                                   color:
-                                      const Color(0xFF00E5C8).withOpacity(0.25),
-                                  width: 1,
+                                      selected ? _primaryBlue : _textSecondary,
+                                  size: 20,
                                 ),
                               ),
-                              child: Center(
-                                child: Text(
-                                  hospital.shortName[0],
-                                  style: TextStyle(fontFamily: 'Poppins',
-                                    fontSize: 22,
-                                    fontWeight: FontWeight.w800,
-                                    color: const Color(0xFF00E5C8),
-                                  ),
+                              const SizedBox(width: 14),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      slot.label,
+                                      style: TextStyle(
+                                        fontFamily: 'Poppins',
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w500,
+                                        color: selected
+                                            ? _primaryBlue
+                                            : _textPrimary,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      slot.range,
+                                      style: const TextStyle(
+                                        fontFamily: 'Poppins',
+                                        fontSize: 11,
+                                        color: _textSecondary,
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ),
-                            ),
-                            const SizedBox(width: 16),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
                                 children: [
-                                  Text(
-                                    hospital.shortName,
-                                    style: TextStyle(fontFamily: 'Poppins',
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 8, vertical: 3),
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(6),
+                                      color: pillBg,
+                                    ),
+                                    child: Text(
+                                      status,
+                                      style: TextStyle(
+                                        fontFamily: 'Poppins',
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w500,
+                                        color: pillText,
+                                      ),
                                     ),
                                   ),
-                                  const SizedBox(height: 3),
-                                  Row(
-                                    children: [
-                                      Icon(
-                                        Icons.location_on_rounded,
-                                        size: 12,
-                                        color: Colors.white.withOpacity(0.4),
+                                  if (!slot.isLunchBreak) ...[
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      disabled
+                                          ? '–'
+                                          : '$spotsLeft left',
+                                      style: const TextStyle(
+                                        fontFamily: 'Poppins',
+                                        fontSize: 10,
+                                        color: _textSecondary,
                                       ),
-                                      const SizedBox(width: 3),
-                                      Expanded(
-                                        child: Text(
-                                          hospital.location,
-                                          style: TextStyle(fontFamily: 'Poppins',
-                                            fontSize: 12,
-                                            color:
-                                                Colors.white.withOpacity(0.4),
-                                          ),
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    hospital.speciality,
-                                    style: TextStyle(fontFamily: 'Poppins',
-                                      fontSize: 11,
-                                      color: Colors.white.withOpacity(0.35),
                                     ),
-                                  ),
+                                  ],
                                 ],
                               ),
-                            ),
-                          ],
-                        ),
-                      ),
-
-                      const SizedBox(height: 24),
-
-                      // ── Live queue stats ─────────────────────────
-                      Row(
-                        children: [
-                          Expanded(
-                            child: _StatCard(
-                              icon: Icons.people_alt_rounded,
-                              label: 'In Queue',
-                              value: '${hospital.currentQueue}',
-                              valueColor: hospital.currentQueue <= 10
-                                  ? const Color(0xFF00E5C8)
-                                  : hospital.currentQueue <= 20
-                                      ? const Color(0xFFFFC107)
-                                      : const Color(0xFFFF5252),
-                            ),
-                          ),
-                          const SizedBox(width: 14),
-                          Expanded(
-                            child: _StatCard(
-                              icon: Icons.schedule_rounded,
-                              label: 'Est. Wait',
-                              value: '~${hospital.estimatedWaitMinutes} min',
-                              valueColor: Colors.white,
-                            ),
-                          ),
-                          const SizedBox(width: 14),
-                          Expanded(
-                            child: _StatCard(
-                              icon: Icons.calendar_today_rounded,
-                              label: 'Date',
-                              value: _todayLabel(),
-                              valueColor: Colors.white,
-                            ),
-                          ),
-                        ],
-                      ),
-
-                      const SizedBox(height: 28),
-
-                      // ── Time slot section ────────────────────────
-                      Text(
-                        'Select Time Slot',
-                        style: TextStyle(fontFamily: 'Poppins',
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.white,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        'Choose your preferred OPD session for today',
-                        style: TextStyle(fontFamily: 'Poppins',
-                          fontSize: 12,
-                          color: Colors.white.withOpacity(0.4),
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-
-                      ..._slots.asMap().entries.map((entry) {
-                        final i = entry.key;
-                        final slot = entry.value;
-                        final disabled = _isDisabled(i);
-                        final selected = !disabled && _selectedSlot == i;
-                        final status = _slotStatus(i);
-
-                        // Pill colors
-                        final Color pillBg;
-                        final Color pillText;
-                        if (slot.isLunchBreak) {
-                          pillBg = Colors.white.withOpacity(0.07);
-                          pillText = Colors.white.withOpacity(0.35);
-                        } else if (disabled) {
-                          pillBg = Colors.red.withOpacity(0.12);
-                          pillText = Colors.redAccent;
-                        } else {
-                          pillBg = const Color(0xFF00E5C8).withOpacity(0.12);
-                          pillText = const Color(0xFF00E5C8);
-                        }
-
-                        return GestureDetector(
-                          onTap: disabled
-                              ? null
-                              : () => setState(() => _selectedSlot = i),
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 220),
-                            curve: Curves.easeOut,
-                            margin: const EdgeInsets.only(bottom: 14),
-                            padding: const EdgeInsets.all(18),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(18),
-                              color: slot.isLunchBreak
-                                  ? const Color(0xFF0F1A25)
-                                  : selected
-                                      ? const Color(0xFF00E5C8)
-                                          .withOpacity(0.10)
-                                      : disabled
-                                          ? const Color(0xFF111D29)
-                                          : const Color(0xFF152438),
-                              border: Border.all(
-                                color: selected
-                                    ? const Color(0xFF00E5C8)
-                                    : const Color(0xFF1E3A52)
-                                        .withOpacity(disabled ? 0.5 : 1),
-                                width: selected ? 1.5 : 1,
-                              ),
-                              boxShadow: selected
-                                  ? [
-                                      BoxShadow(
-                                        color: const Color(0xFF00E5C8)
-                                            .withOpacity(0.18),
-                                        blurRadius: 16,
-                                        offset: const Offset(0, 4),
-                                      ),
-                                    ]
-                                  : null,
-                            ),
-                            child: Row(
-                              children: [
-                                // Icon circle
+                              if (!slot.isLunchBreak) ...[
+                                const SizedBox(width: 10),
                                 AnimatedContainer(
-                                  duration: const Duration(milliseconds: 220),
-                                  width: 48,
-                                  height: 48,
+                                  duration: const Duration(milliseconds: 200),
+                                  width: 18,
+                                  height: 18,
                                   decoration: BoxDecoration(
                                     shape: BoxShape.circle,
                                     color: selected
-                                        ? const Color(0xFF00E5C8)
-                                            .withOpacity(0.18)
-                                        : Colors.white
-                                            .withOpacity(disabled ? 0.03 : 0.05),
+                                        ? _primaryBlue
+                                        : Colors.transparent,
                                     border: Border.all(
                                       color: selected
-                                          ? const Color(0xFF00E5C8)
-                                              .withOpacity(0.4)
-                                          : Colors.white
-                                              .withOpacity(disabled ? 0.05 : 0.08),
-                                      width: 1,
+                                          ? _primaryBlue
+                                          : _borderColor,
+                                      width: 1.5,
                                     ),
                                   ),
-                                  child: Icon(
-                                    slot.icon,
-                                    color: selected
-                                        ? const Color(0xFF00E5C8)
-                                        : Colors.white
-                                            .withOpacity(disabled ? 0.18 : 0.35),
-                                    size: 22,
-                                  ),
+                                  child: selected
+                                      ? const Icon(Icons.check_rounded,
+                                          size: 11, color: Colors.white)
+                                      : null,
                                 ),
-                                const SizedBox(width: 16),
-                                // Labels
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        slot.label,
-                                        style: TextStyle(fontFamily: 'Poppins',
-                                          fontSize: 15,
-                                          fontWeight: FontWeight.w700,
-                                          color: selected
-                                              ? Colors.white
-                                              : Colors.white.withOpacity(
-                                                  disabled ? 0.3 : 0.7),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 3),
-                                      Text(
-                                        slot.range,
-                                        style: TextStyle(fontFamily: 'Poppins',
-                                          fontSize: 12,
-                                          color: selected
-                                              ? const Color(0xFF00E5C8)
-                                              : Colors.white.withOpacity(
-                                                  disabled ? 0.2 : 0.35),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                // Right side: spots + status pill + radio
-                                Column(
-                                  crossAxisAlignment: CrossAxisAlignment.end,
-                                  children: [
-                                    // Status pill
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 10, vertical: 4),
-                                      decoration: BoxDecoration(
-                                        borderRadius: BorderRadius.circular(20),
-                                        color: pillBg,
-                                        border: Border.all(
-                                          color: pillText.withOpacity(0.3),
-                                          width: 1,
-                                        ),
-                                      ),
-                                      child: Text(
-                                        status,
-                                        style: TextStyle(fontFamily: 'Poppins',
-                                          fontSize: 10.5,
-                                          fontWeight: FontWeight.w600,
-                                          color: pillText,
-                                        ),
-                                      ),
-                                    ),
-                                    if (!slot.isLunchBreak) ...[
-                                      const SizedBox(height: 6),
-                                      Text(
-                                        disabled
-                                            ? '–'
-                                            : '${slot.spotsLeft} left',
-                                        style: TextStyle(fontFamily: 'Poppins',
-                                          fontSize: 11,
-                                          color: Colors.white
-                                              .withOpacity(disabled ? 0.2 : 0.4),
-                                        ),
-                                      ),
-                                    ],
-                                  ],
-                                ),
-                                // Radio indicator (only on bookable slots)
-                                if (!slot.isLunchBreak) ...[
-                                  const SizedBox(width: 12),
-                                  AnimatedContainer(
-                                    duration: const Duration(milliseconds: 220),
-                                    width: 20,
-                                    height: 20,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      color: selected
-                                          ? const Color(0xFF00E5C8)
-                                          : Colors.transparent,
-                                      border: Border.all(
-                                        color: selected
-                                            ? const Color(0xFF00E5C8)
-                                            : const Color(0xFF1E3A52)
-                                                .withOpacity(
-                                                    disabled ? 0.4 : 1),
-                                        width: 2,
-                                      ),
-                                    ),
-                                    child: selected
-                                        ? const Icon(Icons.check_rounded,
-                                            size: 12,
-                                            color: Color(0xFF0D1B2A))
-                                        : null,
-                                  ),
-                                ],
                               ],
-                            ),
+                            ],
                           ),
-                        );
-                      }),
-
-                      const SizedBox(height: 8),
-
-                      // ── Notice ───────────────────────────────────
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 12,
-                        ),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(12),
-                          color: const Color(0xFF0057FF).withOpacity(0.07),
-                          border: Border.all(
-                            color: const Color(0xFF0057FF).withOpacity(0.18),
-                            width: 1,
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(
-                              Icons.info_outline_rounded,
-                              size: 16,
-                              color: const Color(0xFF6EA8FF),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                'Please arrive 10 minutes before your slot. '
-                                'Token expires if not checked in within 30 minutes.',
-                                style: TextStyle(fontFamily: 'Poppins',
-                                  fontSize: 11.5,
-                                  color: const Color(0xFF6EA8FF),
-                                  height: 1.5,
-                                ),
-                              ),
-                            ),
-                          ],
                         ),
                       ),
+                    );
+                  }),
 
-                      const SizedBox(height: 32),
-                    ],
-                  ),
-                ),
-              ),
+                  const SizedBox(height: 8),
 
-              // ── Confirm button ───────────────────────────────────
-              Container(
-                padding: EdgeInsets.fromLTRB(20, 16, 20, bottomPad + 20),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF0D1B2A),
-                  border: const Border(
-                    top: BorderSide(color: Color(0xFF1E3A52), width: 1),
-                  ),
-                ),
-                child: GestureDetector(
-                  onTap: _selectedSlot == -1 ? null : _onConfirm,
-                  child: AnimatedBuilder(
-                    animation: _shimmerController,
-                    builder: (_, __) {
-                      final active = _selectedSlot != -1;
-                      return AnimatedContainer(
-                        duration: const Duration(milliseconds: 250),
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(vertical: 18),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(18),
-                          gradient: active
-                              ? LinearGradient(
-                                  begin: Alignment.centerLeft,
-                                  end: Alignment.centerRight,
-                                  colors: const [
-                                    Color(0xFF00E5C8),
-                                    Color(0xFF00CFBA),
-                                    Color(0xFF00E5C8),
-                                  ],
-                                  stops: [
-                                    0.0,
-                                    _shimmerController.value,
-                                    1.0,
-                                  ],
-                                )
-                              : null,
-                          color: active ? null : const Color(0xFF152438),
-                          border: active
-                              ? null
-                              : Border.all(
-                                  color: const Color(0xFF1E3A52), width: 1),
-                          boxShadow: active
-                              ? [
-                                  BoxShadow(
-                                    color: const Color(0xFF00E5C8)
-                                        .withOpacity(0.40),
-                                    blurRadius: 20,
-                                    offset: const Offset(0, 6),
-                                  ),
-                                ]
-                              : null,
-                        ),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              Icons.confirmation_number_rounded,
-                              color: active
-                                  ? const Color(0xFF0D1B2A)
-                                  : Colors.white.withOpacity(0.25),
-                              size: 20,
+                  // ── Wait time info bar ─────────────────────────────
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 12),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      color: const Color(0xFFFFFBEB),
+                      border: Border.all(
+                          color: const Color(0xFFFDE68A), width: 0.5),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.access_time_outlined,
+                            size: 15, color: Color(0xFF92400E)),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Est. wait: ~${_activeCount * (hospital.estimatedWaitMinutes > 0 ? hospital.estimatedWaitMinutes : 5)} min · Please arrive 10 min early',
+                            style: const TextStyle(
+                              fontFamily: 'Poppins',
+                              fontSize: 11,
+                              color: Color(0xFF92400E),
+                              height: 1.4,
                             ),
-                            const SizedBox(width: 10),
-                            Text(
-                              active
-                                  ? 'Confirm Token'
-                                  : 'Select a slot to continue',
-                              style: TextStyle(fontFamily: 'Poppins',
-                                fontSize: 15,
-                                fontWeight: FontWeight.w700,
-                                color: active
-                                    ? const Color(0xFF0D1B2A)
-                                    : Colors.white.withOpacity(0.25),
-                                letterSpacing: 0.2,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 28),
+                ],
+              ),
+            ),
+          ),
+
+          // ── Confirm button ─────────────────────────────────────────
+          Container(
+            padding: EdgeInsets.fromLTRB(20, 14, 20, bottomPad + 20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              border:
+                  const Border(top: BorderSide(color: _borderColor, width: 0.5)),
+            ),
+            child: Column(
+              children: [
+                GestureDetector(
+                  onTap: (_selectedSlot == -1 || _saving) ? null : _onConfirm,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(14),
+                      color: _selectedSlot != -1
+                          ? _primaryBlue
+                          : const Color(0xFFF3F4F6),
+                    ),
+                    child: _saving
+                        ? const Center(
+                            child: SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
                               ),
                             ),
-                          ],
-                        ),
-                      );
-                    },
+                          )
+                        : Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.confirmation_number_outlined,
+                                color: _selectedSlot != -1
+                                    ? Colors.white
+                                    : _textSecondary,
+                                size: 18,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                _selectedSlot != -1
+                                    ? 'Confirm booking'
+                                    : 'Select a slot to continue',
+                                style: TextStyle(
+                                  fontFamily: 'Poppins',
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w500,
+                                  color: _selectedSlot != -1
+                                      ? Colors.white
+                                      : _textSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
                   ),
                 ),
-              ),
-            ],
+                const SizedBox(height: 8),
+                const Text(
+                  "You'll receive a token number after confirmation",
+                  style: TextStyle(
+                    fontFamily: 'Poppins',
+                    fontSize: 11,
+                    color: _textSecondary,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -739,7 +704,7 @@ class _TokenBookingScreenState extends State<TokenBookingScreen>
   }
 }
 
-// ── Stat card widget ─────────────────────────────────────────────────────────
+// ── Stat card ──────────────────────────────────────────────────────────────────
 
 class _StatCard extends StatelessWidget {
   final IconData icon;
@@ -757,32 +722,34 @@ class _StatCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        color: const Color(0xFF152438),
-        border: Border.all(color: const Color(0xFF1E3A52), width: 1),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: _borderColor, width: 0.5),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, size: 15, color: Colors.white.withOpacity(0.35)),
-          const SizedBox(height: 8),
+          Icon(icon, size: 14, color: _textSecondary),
+          const SizedBox(height: 6),
           Text(
             value,
-            style: TextStyle(fontFamily: 'Poppins',
-              fontSize: 14,
-              fontWeight: FontWeight.w700,
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
               color: valueColor,
             ),
             overflow: TextOverflow.ellipsis,
           ),
-          const SizedBox(height: 2),
+          const SizedBox(height: 1),
           Text(
             label,
-            style: TextStyle(fontFamily: 'Poppins',
+            style: const TextStyle(
+              fontFamily: 'Poppins',
               fontSize: 10,
-              color: Colors.white.withOpacity(0.35),
+              color: _textSecondary,
             ),
           ),
         ],
@@ -791,18 +758,22 @@ class _StatCard extends StatelessWidget {
   }
 }
 
-// ── Success bottom sheet ─────────────────────────────────────────────────────
+// ── Success bottom sheet ───────────────────────────────────────────────────────
 
 class _SuccessSheet extends StatefulWidget {
+  final String tokenId;
   final String token;
   final Hospital hospital;
   final _TimeSlot slot;
+  final int peopleAhead;
   final VoidCallback onDone;
 
   const _SuccessSheet({
+    required this.tokenId,
     required this.token,
     required this.hospital,
     required this.slot,
+    required this.peopleAhead,
     required this.onDone,
   });
 
@@ -848,178 +819,148 @@ class _SuccessSheetState extends State<_SuccessSheet>
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
       padding: EdgeInsets.fromLTRB(24, 28, 24, bottomPad + 20),
       decoration: BoxDecoration(
-        color: const Color(0xFF0F1E30),
-        borderRadius: BorderRadius.circular(28),
-        border: Border.all(color: const Color(0xFF1E3A52), width: 1),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: _borderColor, width: 0.5),
         boxShadow: [
           BoxShadow(
-            color: const Color(0xFF00E5C8).withOpacity(0.08),
-            blurRadius: 40,
-            offset: const Offset(0, -10),
+            color: Colors.black.withOpacity(0.08),
+            blurRadius: 24,
+            offset: const Offset(0, -4),
           ),
         ],
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Success icon with scale-in
           ScaleTransition(
             scale: _scaleAnim,
             child: FadeTransition(
               opacity: _fadeAnim,
               child: Container(
-                width: 80,
-                height: 80,
+                width: 72,
+                height: 72,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  gradient: const LinearGradient(
-                    colors: [Color(0xFF00E5C8), Color(0xFF00B8A0)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: const Color(0xFF00E5C8).withOpacity(0.4),
-                      blurRadius: 24,
-                      offset: const Offset(0, 6),
-                    ),
-                  ],
+                  color: _successGreen.withOpacity(0.1),
                 ),
                 child: const Icon(
                   Icons.check_rounded,
-                  color: Color(0xFF0D1B2A),
-                  size: 40,
+                  color: _successGreen,
+                  size: 36,
                 ),
               ),
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          const Text(
+            'Token Booked!',
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: 20,
+              fontWeight: FontWeight.w500,
+              color: _textPrimary,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            widget.hospital.shortName,
+            style: const TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: 13,
+              color: _primaryBlue,
+              fontWeight: FontWeight.w500,
             ),
           ),
 
           const SizedBox(height: 20),
 
-          Text(
-            'Token Booked!',
-            style: TextStyle(fontFamily: 'Poppins',
-              fontSize: 22,
-              fontWeight: FontWeight.w800,
-              color: Colors.white,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            widget.hospital.shortName,
-            style: TextStyle(fontFamily: 'Poppins',
-              fontSize: 13,
-              color: const Color(0xFF00E5C8),
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-
-          const SizedBox(height: 24),
-
           // Token number display
           Container(
             width: double.infinity,
-            padding: const EdgeInsets.symmetric(vertical: 22),
+            padding: const EdgeInsets.symmetric(vertical: 20),
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(20),
-              gradient: LinearGradient(
-                colors: [
-                  const Color(0xFF00E5C8).withOpacity(0.12),
-                  const Color(0xFF0057FF).withOpacity(0.06),
-                ],
-              ),
-              border: Border.all(
-                color: const Color(0xFF00E5C8).withOpacity(0.25),
-                width: 1,
-              ),
+              borderRadius: BorderRadius.circular(16),
+              color: _selectedBg,
+              border:
+                  Border.all(color: _primaryBlue.withOpacity(0.2), width: 0.5),
             ),
             child: Column(
               children: [
-                Text(
+                const Text(
                   'Your Token Number',
-                  style: TextStyle(fontFamily: 'Poppins',
+                  style: TextStyle(
+                    fontFamily: 'Poppins',
                     fontSize: 12,
-                    color: Colors.white.withOpacity(0.45),
+                    color: _textSecondary,
                   ),
                 ),
                 const SizedBox(height: 8),
-                ShaderMask(
-                  shaderCallback: (bounds) => const LinearGradient(
-                    colors: [Color(0xFF00E5C8), Color(0xFF00CFFF)],
-                  ).createShader(bounds),
-                  child: Text(
-                    widget.token,
-                    style: TextStyle(fontFamily: 'Poppins',
-                      fontSize: 42,
-                      fontWeight: FontWeight.w900,
-                      color: Colors.white,
-                      letterSpacing: 2,
-                    ),
+                Text(
+                  widget.token,
+                  style: const TextStyle(
+                    fontFamily: 'Poppins',
+                    fontSize: 36,
+                    fontWeight: FontWeight.w500,
+                    color: _primaryBlue,
+                    letterSpacing: 2,
                   ),
                 ),
               ],
             ),
           ),
 
-          const SizedBox(height: 16),
+          const SizedBox(height: 14),
 
-          // Details row
           Row(
             children: [
               Expanded(
                 child: _DetailTile(
-                  icon: Icons.schedule_rounded,
+                  icon: Icons.schedule_outlined,
                   label: 'Slot',
-                  value: widget.slot.label,
+                  value: widget.slot.label.split(' ').first,
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 10),
               Expanded(
                 child: _DetailTile(
-                  icon: Icons.access_time_filled_rounded,
+                  icon: Icons.access_time_outlined,
                   label: 'Time',
                   value: widget.slot.range.split('–').first.trim(),
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 10),
               Expanded(
                 child: _DetailTile(
-                  icon: Icons.people_alt_rounded,
+                  icon: Icons.people_alt_outlined,
                   label: 'Ahead',
-                  value: '${widget.hospital.currentQueue}',
+                  value: '${widget.peopleAhead}',
                 ),
               ),
             ],
           ),
 
-          const SizedBox(height: 24),
+          const SizedBox(height: 20),
 
-          // Done button
           GestureDetector(
             onTap: widget.onDone,
             child: Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 16),
+              padding: const EdgeInsets.symmetric(vertical: 14),
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(16),
-                gradient: const LinearGradient(
-                  colors: [Color(0xFF00E5C8), Color(0xFF00B8A0)],
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: const Color(0xFF00E5C8).withOpacity(0.35),
-                    blurRadius: 16,
-                    offset: const Offset(0, 6),
-                  ),
-                ],
+                borderRadius: BorderRadius.circular(14),
+                color: _primaryBlue,
               ),
-              child: Center(
+              child: const Center(
                 child: Text(
                   'Done',
-                  style: TextStyle(fontFamily: 'Poppins',
-                    fontSize: 15,
-                    fontWeight: FontWeight.w700,
-                    color: const Color(0xFF0D1B2A),
+                  style: TextStyle(
+                    fontFamily: 'Poppins',
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    color: Colors.white,
                   ),
                 ),
               ),
@@ -1045,30 +986,32 @@ class _DetailTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12),
-        color: Colors.white.withOpacity(0.04),
-        border: Border.all(color: Colors.white.withOpacity(0.07), width: 1),
+        borderRadius: BorderRadius.circular(10),
+        color: const Color(0xFFF9FAFB),
+        border: Border.all(color: _borderColor, width: 0.5),
       ),
       child: Column(
         children: [
-          Icon(icon, size: 15, color: const Color(0xFF00E5C8)),
-          const SizedBox(height: 6),
+          Icon(icon, size: 14, color: _primaryBlue),
+          const SizedBox(height: 5),
           Text(
             value,
-            style: TextStyle(fontFamily: 'Poppins',
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-              color: Colors.white,
+            style: const TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+              color: _textPrimary,
             ),
           ),
-          const SizedBox(height: 2),
+          const SizedBox(height: 1),
           Text(
             label,
-            style: TextStyle(fontFamily: 'Poppins',
+            style: const TextStyle(
+              fontFamily: 'Poppins',
               fontSize: 10,
-              color: Colors.white.withOpacity(0.35),
+              color: _textSecondary,
             ),
           ),
         ],

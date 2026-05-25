@@ -2,6 +2,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'phone_auth_stub.dart' if (dart.library.html) 'phone_auth_web.dart';
+import 'queue_notification_service.dart';
 
 class AuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
@@ -73,21 +74,42 @@ class AuthService {
   }
 
   Future<void> _ensureUserDocument(User user) async {
-    final docRef = _db.collection('users').doc(user.uid);
-    final doc = await docRef.get();
-    if (!doc.exists) {
-      await docRef.set({
-        'uid': user.uid,
-        'name': user.displayName ?? '',
-        'phone': user.phoneNumber ?? '',
-        'role': 'patient',
-        'created_at': FieldValue.serverTimestamp(),
-      });
+    // Check by uid field first — the doc ID may differ from the auth uid
+    // (e.g. staff docs created manually with a different ID).
+    final existing = await _db
+        .collection('users')
+        .where('uid', isEqualTo: user.uid)
+        .limit(1)
+        .get();
+    if (existing.docs.isNotEmpty) return;
+
+    // Also check by phone to avoid duplicating a manually-created doc.
+    if (user.phoneNumber != null && user.phoneNumber!.isNotEmpty) {
+      final byPhone = await _db
+          .collection('users')
+          .where('phone', isEqualTo: user.phoneNumber)
+          .limit(1)
+          .get();
+      if (byPhone.docs.isNotEmpty) return;
     }
+
+    // Genuinely new user — create their document.
+    await _db.collection('users').doc(user.uid).set({
+      'uid': user.uid,
+      'name': user.displayName ?? '',
+      'phone': user.phoneNumber ?? '',
+      'role': 'patient',
+      'created_at': FieldValue.serverTimestamp(),
+    });
   }
 
   Future<void> signOut() async {
     clearRecaptcha();
+    QueueNotificationService.instance.detach();
     await _auth.signOut();
+    // Clear Firestore local cache so stale role data never survives across logins.
+    try {
+      await _db.clearPersistence();
+    } catch (_) {}
   }
 }
