@@ -1,7 +1,5 @@
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_auth_platform_interface/firebase_auth_platform_interface.dart';
 
-RecaptchaVerifier? _recaptchaVerifier;
 ConfirmationResult? _confirmationResult;
 
 Future<void> initRecaptchaAndSendOtp({
@@ -10,40 +8,12 @@ Future<void> initRecaptchaAndSendOtp({
   required PhoneCodeSent codeSent,
   required PhoneVerificationFailed verificationFailed,
 }) async {
+  if (auth.currentUser != null) return;
   try {
-    _recaptchaVerifier?.clear();
-
-    // FirebaseAuth._delegate is private; reconstruct the platform instance
-    // from the two public getters FirebaseAuth inherits via FirebasePluginPlatform.
-    final authPlatform = FirebaseAuthPlatform.instanceFor(
-      app: auth.app,
-      pluginConstants: auth.pluginConstants,
-    );
-
-    _recaptchaVerifier = RecaptchaVerifier(
-      auth: authPlatform,
-      container: 'recaptcha-container',
-      size: RecaptchaVerifierSize.normal,
-      onSuccess: () {},
-      onError: (e) => verificationFailed(e),
-      onExpired: () {},
-    );
-
-    await _recaptchaVerifier!.render();
-
-    _confirmationResult = await auth.signInWithPhoneNumber(
-      phoneNumber,
-      _recaptchaVerifier!,
-    );
-
-    // Widget no longer needed once OTP has been dispatched.
-    _recaptchaVerifier!.clear();
-    _recaptchaVerifier = null;
-
+    // No RecaptchaVerifier passed — Firebase handles verification internally.
+    _confirmationResult = await auth.signInWithPhoneNumber(phoneNumber);
     codeSent(_confirmationResult!.verificationId, null);
   } on FirebaseAuthException catch (e) {
-    _recaptchaVerifier?.clear();
-    _recaptchaVerifier = null;
     _confirmationResult = null;
     verificationFailed(e);
   }
@@ -51,13 +21,13 @@ Future<void> initRecaptchaAndSendOtp({
 
 Future<UserCredential?> confirmWithStoredResult(String smsCode) async {
   if (_confirmationResult == null) return null;
-  return await _confirmationResult!.confirm(smsCode);
+  final result = await _confirmationResult!.confirm(smsCode);
+  _confirmationResult = null;
+  return result;
 }
 
 bool get hasStoredResult => _confirmationResult != null;
 
 void clearRecaptcha() {
-  _recaptchaVerifier?.clear();
-  _recaptchaVerifier = null;
   _confirmationResult = null;
 }

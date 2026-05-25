@@ -65,5 +65,5 @@ class TokenModel {
         'issued_at': Timestamp.fromDate(issuedAt),
       };
 
-  bool get isActive => status == 'active';
+  bool get isActive => status == 'active' || status == 'called';
 }

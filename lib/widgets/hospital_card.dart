@@ -1,20 +1,27 @@
 import 'package:flutter/material.dart';
 import '../models/hospital.dart';
 
+const _primaryBlue = Color(0xFF4F6BED);
+const _borderColor = Color(0xFFE5E7EB);
+const _textPrimary = Color(0xFF1F2937);
+const _textSecondary = Color(0xFF9CA3AF);
+
 class HospitalCard extends StatelessWidget {
   final Hospital hospital;
+  final int activeCount;
   final VoidCallback onBookTap;
 
   const HospitalCard({
     super.key,
     required this.hospital,
+    required this.activeCount,
     required this.onBookTap,
   });
 
   Color _queueColor(int queue) {
-    if (queue <= 10) return const Color(0xFF00E5C8);
-    if (queue <= 20) return const Color(0xFFFFC107);
-    return const Color(0xFFFF5252);
+    if (queue <= 10) return const Color(0xFF10B981);
+    if (queue <= 20) return const Color(0xFFD97706);
+    return const Color(0xFFEF4444);
   }
 
   String _queueLabel(int queue) {
@@ -25,257 +32,198 @@ class HospitalCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final queueColor = _queueColor(hospital.currentQueue);
+    final queueColor = _queueColor(activeCount);
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 16),
+      margin: const EdgeInsets.only(bottom: 14),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            const Color(0xFF152438),
-            const Color(0xFF0F1E30),
-          ],
-        ),
-        border: Border.all(
-          color: const Color(0xFF1E3A52),
-          width: 1,
-        ),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _borderColor, width: 0.5),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.3),
-            blurRadius: 16,
-            offset: const Offset(0, 6),
+            color: Colors.black.withOpacity(0.04),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
           ),
         ],
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(20),
-        child: Stack(
+        borderRadius: BorderRadius.circular(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Subtle accent glow top-left
-            Positioned(
-              top: -20,
-              left: -20,
-              child: Container(
-                width: 80,
-                height: 80,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: queueColor.withOpacity(0.07),
+            // ── Placeholder image area ─────────────────────────────
+            Container(
+              width: double.infinity,
+              height: 96,
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [Color(0xFFE0E7FF), Color(0xFFC7D2FE)],
                 ),
               ),
+              child: Stack(
+                children: [
+                  Center(
+                    child: Icon(
+                      Icons.local_hospital_outlined,
+                      size: 40,
+                      color: _primaryBlue.withOpacity(0.4),
+                    ),
+                  ),
+                  // Open / Closed badge
+                  Positioned(
+                    top: 10,
+                    right: 10,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 4),
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(20),
+                        color: hospital.isOpen
+                            ? const Color(0xFF10B981)
+                            : const Color(0xFFEF4444),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            width: 5,
+                            height: 5,
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(width: 5),
+                          Text(
+                            hospital.isOpen ? 'Open' : 'Closed',
+                            style: const TextStyle(
+                              fontFamily: 'Poppins',
+                              fontSize: 10,
+                              fontWeight: FontWeight.w500,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
+
+            // ── Card body ──────────────────────────────────────────
             Padding(
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.all(14),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Header row
+                  // Name + location
+                  Text(
+                    hospital.shortName,
+                    style: const TextStyle(
+                      fontFamily: 'Poppins',
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      color: _textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    hospital.name,
+                    style: const TextStyle(
+                      fontFamily: 'Poppins',
+                      fontSize: 11,
+                      color: _textSecondary,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 4),
                   Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Hospital icon badge
-                      Container(
-                        width: 48,
-                        height: 48,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(14),
-                          color: const Color(0xFF00E5C8).withOpacity(0.12),
-                          border: Border.all(
-                            color: const Color(0xFF00E5C8).withOpacity(0.25),
-                            width: 1,
-                          ),
-                        ),
-                        child: Center(
-                          child: Text(
-                            hospital.shortName[0],
-                            style: TextStyle(fontFamily: 'Poppins',
-                              fontSize: 20,
-                              fontWeight: FontWeight.w700,
-                              color: const Color(0xFF00E5C8),
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 14),
+                      const Icon(Icons.location_on_outlined,
+                          size: 12, color: _textSecondary),
+                      const SizedBox(width: 3),
                       Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              hospital.shortName,
-                              style: TextStyle(fontFamily: 'Poppins',
-                                fontSize: 17,
-                                fontWeight: FontWeight.w700,
-                                color: Colors.white,
-                                letterSpacing: 0.2,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            Row(
-                              children: [
-                                Icon(
-                                  Icons.location_on_rounded,
-                                  size: 12,
-                                  color: Colors.white.withOpacity(0.45),
-                                ),
-                                const SizedBox(width: 3),
-                                Expanded(
-                                  child: Text(
-                                    hospital.location,
-                                    style: TextStyle(fontFamily: 'Poppins',
-                                      fontSize: 11.5,
-                                      color: Colors.white.withOpacity(0.45),
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                      // Open/Closed badge
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(20),
-                          color: hospital.isOpen
-                              ? const Color(0xFF00E5C8).withOpacity(0.12)
-                              : Colors.red.withOpacity(0.12),
-                          border: Border.all(
-                            color: hospital.isOpen
-                                ? const Color(0xFF00E5C8).withOpacity(0.4)
-                                : Colors.red.withOpacity(0.4),
-                            width: 1,
-                          ),
-                        ),
                         child: Text(
-                          hospital.isOpen ? 'Open' : 'Closed',
-                          style: TextStyle(fontFamily: 'Poppins',
+                          hospital.location,
+                          style: const TextStyle(
+                            fontFamily: 'Poppins',
                             fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                            color: hospital.isOpen
-                                ? const Color(0xFF00E5C8)
-                                : Colors.redAccent,
+                            color: _textSecondary,
                           ),
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ],
                   ),
 
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 12),
+                  Container(height: 0.5, color: _borderColor),
+                  const SizedBox(height: 12),
 
-                  // Speciality
-                  Text(
-                    hospital.speciality,
-                    style: TextStyle(fontFamily: 'Poppins',
-                      fontSize: 12,
-                      color: Colors.white.withOpacity(0.5),
-                      fontWeight: FontWeight.w400,
-                    ),
-                  ),
-
-                  const SizedBox(height: 16),
-
-                  // Divider
-                  Container(
-                    height: 1,
-                    color: const Color(0xFF1E3A52),
-                  ),
-
-                  const SizedBox(height: 16),
-
-                  // Stats + Button row
+                  // Stats + book button
                   Row(
                     children: [
-                      // Queue stat
-                      _StatChip(
-                        icon: Icons.people_alt_rounded,
-                        label: 'In Queue',
-                        value: '${hospital.currentQueue}',
-                        valueColor: queueColor,
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: queueColor,
+                        ),
                       ),
-                      const SizedBox(width: 16),
-                      // Wait stat
-                      _StatChip(
-                        icon: Icons.schedule_rounded,
-                        label: 'Est. Wait',
-                        value: '~${hospital.estimatedWaitMinutes}m',
-                        valueColor: Colors.white,
+                      const SizedBox(width: 6),
+                      Text(
+                        '$activeCount in queue',
+                        style: const TextStyle(
+                          fontFamily: 'Poppins',
+                          fontSize: 12,
+                          color: _textSecondary,
+                        ),
                       ),
-
-                      // Queue status pill
                       const SizedBox(width: 10),
                       Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 9,
-                          vertical: 4,
-                        ),
+                            horizontal: 7, vertical: 2),
                         decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(20),
-                          color: queueColor.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(6),
+                          color: queueColor.withOpacity(0.1),
                         ),
                         child: Text(
-                          _queueLabel(hospital.currentQueue),
-                          style: TextStyle(fontFamily: 'Poppins',
-                            fontSize: 10.5,
-                            fontWeight: FontWeight.w600,
+                          _queueLabel(activeCount),
+                          style: TextStyle(
+                            fontFamily: 'Poppins',
+                            fontSize: 10,
+                            fontWeight: FontWeight.w500,
                             color: queueColor,
                           ),
                         ),
                       ),
-
                       const Spacer(),
-
-                      // Book Token button
                       GestureDetector(
                         onTap: hospital.isOpen ? onBookTap : null,
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 200),
+                        child: Container(
                           padding: const EdgeInsets.symmetric(
-                            horizontal: 18,
-                            vertical: 11,
-                          ),
+                              horizontal: 16, vertical: 8),
                           decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(14),
-                            gradient: hospital.isOpen
-                                ? const LinearGradient(
-                                    colors: [
-                                      Color(0xFF00E5C8),
-                                      Color(0xFF00B8A0),
-                                    ],
-                                  )
-                                : null,
+                            borderRadius: BorderRadius.circular(10),
                             color: hospital.isOpen
-                                ? null
-                                : Colors.white.withOpacity(0.08),
-                            boxShadow: hospital.isOpen
-                                ? [
-                                    BoxShadow(
-                                      color: const Color(0xFF00E5C8)
-                                          .withOpacity(0.35),
-                                      blurRadius: 12,
-                                      offset: const Offset(0, 4),
-                                    ),
-                                  ]
-                                : null,
+                                ? _primaryBlue
+                                : const Color(0xFFF3F4F6),
                           ),
                           child: Text(
-                            'Book Token',
-                            style: TextStyle(fontFamily: 'Poppins',
-                              fontSize: 12.5,
-                              fontWeight: FontWeight.w700,
+                            'Book token',
+                            style: TextStyle(
+                              fontFamily: 'Poppins',
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
                               color: hospital.isOpen
-                                  ? const Color(0xFF0D1B2A)
-                                  : Colors.white.withOpacity(0.3),
-                              letterSpacing: 0.2,
+                                  ? Colors.white
+                                  : _textSecondary,
                             ),
                           ),
                         ),
@@ -288,51 +236,6 @@ class HospitalCard extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-class _StatChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final String value;
-  final Color valueColor;
-
-  const _StatChip({
-    required this.icon,
-    required this.label,
-    required this.value,
-    required this.valueColor,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Icon(icon, size: 12, color: Colors.white.withOpacity(0.35)),
-            const SizedBox(width: 4),
-            Text(
-              label,
-              style: TextStyle(fontFamily: 'Poppins',
-                fontSize: 10.5,
-                color: Colors.white.withOpacity(0.35),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 2),
-        Text(
-          value,
-          style: TextStyle(fontFamily: 'Poppins',
-            fontSize: 15,
-            fontWeight: FontWeight.w700,
-            color: valueColor,
-          ),
-        ),
-      ],
     );
   }
 }

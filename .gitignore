@@ -49,14 +49,26 @@ app.*.map.json
 # Firebase credentials
 lib/firebase_options.dart
 google-services.json
+android/app/google-services.json
 GoogleService-Info.plist
+ios/Runner/GoogleService-Info.plist
 .firebase/
 firebase.json
 .firebaserc
+web/firebase-config.js
+
+# Android signing
+*.keystore
+*.jks
+*.p12
+*.pem
+key.properties
+android/key.properties
 
 # Claude Code
 .claude/
 
 # Environment
 .env
+.env.*
 *.env

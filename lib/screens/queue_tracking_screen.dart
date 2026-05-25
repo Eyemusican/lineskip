@@ -1,18 +1,30 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../services/firestore_service.dart';
 import '../models/token_model.dart';
+import '../utils/audio_helper.dart';
+import '../services/queue_notification_service.dart';
+
+const _primaryBlue = Color(0xFF4F6BED);
+const _lightBlue = Color(0xFF6C8BF5);
+const _bgColor = Color(0xFFFAFBFD);
+const _textPrimary = Color(0xFF1F2937);
+const _textSecondary = Color(0xFF9CA3AF);
+const _borderColor = Color(0xFFE5E7EB);
+const _selectedBg = Color(0xFFEEF2FF);
+const _successGreen = Color(0xFF10B981);
 
 class QueueTrackingScreen extends StatefulWidget {
   final String tokenNumber;
   final String hospitalShort;
   final String hospitalFull;
+  final String hospitalId;
   final String session;
   final IconData sessionIcon;
   final int initialPeopleAhead;
   final int totalQueue;
   final int waitMinutes;
-  // When provided, real-time updates come from Firestore instead of simulation.
   final String? tokenId;
 
   const QueueTrackingScreen({
@@ -20,6 +32,7 @@ class QueueTrackingScreen extends StatefulWidget {
     required this.tokenNumber,
     required this.hospitalShort,
     required this.hospitalFull,
+    required this.hospitalId,
     required this.session,
     required this.sessionIcon,
     required this.initialPeopleAhead,
@@ -37,11 +50,29 @@ class _QueueTrackingScreenState extends State<QueueTrackingScreen>
   late int _peopleAhead;
   late int _waitMinutes;
   late int _totalQueue;
+  String? _nowServing;
+  String? _prevTokenStatus;
   bool _notifyEnabled = false;
-  Timer? _refreshTimer;
+  bool _turnAlertShown = false;
   StreamSubscription<TokenModel?>? _tokenSubscription;
+  StreamSubscription<String?>? _nowServingSubscription;
+  StreamSubscription<int>? _totalQueueSubscription;
 
-  // Animation controllers
+  // Alert state
+  bool _initialLoadComplete = false;
+  bool _earlyAlertShown = false;
+  bool _fiveAheadShown = false;
+  bool _twoAheadShown = false;
+  bool _absentAlertShown = false;
+  int _prevTokenPosition = 0;
+  int _prevPeopleAheadTrack = 0;
+
+  // Banner state
+  String? _bannerMessage;
+  Color _bannerColor = const Color(0xFF4F6BED);
+  bool _bannerPersistent = false;
+  bool _bannerVisible = false;
+
   late AnimationController _arcController;
   late AnimationController _pulseController;
   late AnimationController _countController;
@@ -54,6 +85,8 @@ class _QueueTrackingScreenState extends State<QueueTrackingScreen>
   @override
   void initState() {
     super.initState();
+    // Suppress global overlays while this screen is active — it shows its own banners.
+    QueueNotificationService.instance.isQueueScreenActive = true;
     _peopleAhead = widget.initialPeopleAhead;
     _waitMinutes = widget.waitMinutes;
     _totalQueue = widget.totalQueue;
@@ -81,12 +114,32 @@ class _QueueTrackingScreenState extends State<QueueTrackingScreen>
     );
     _arcController.forward();
 
+    final svc = FirestoreService();
+
+    // Live "Now serving" token number
+    _nowServingSubscription =
+        svc.getNowServingStream(widget.hospitalId).listen((tokenNum) {
+      if (mounted) setState(() => _nowServing = tokenNum);
+    });
+
+    // Live total queue count (active + called)
+    _totalQueueSubscription =
+        svc.getActiveTokenCountStream(widget.hospitalId).listen((count) {
+      if (mounted) setState(() => _totalQueue = count);
+    });
+
+    // Live token status updates
     if (widget.tokenId != null) {
-      // Real-time updates from Firestore
-      _tokenSubscription = FirestoreService()
-          .getTokenStream(widget.tokenId!)
-          .listen((token) {
-        if (token != null && mounted) {
+      _tokenSubscription =
+          svc.getTokenStream(widget.tokenId!).listen((token) {
+        if (token == null || !mounted) return;
+
+        // First event: capture baseline, don't fire any alerts.
+        if (!_initialLoadComplete) {
+          _initialLoadComplete = true;
+          _prevTokenStatus = token.status;
+          _prevTokenPosition = token.tokenPosition;
+          _prevPeopleAheadTrack = token.peopleAhead;
           setState(() {
             _peopleAhead = token.peopleAhead;
             _waitMinutes = token.estimatedWaitMinutes;
@@ -95,17 +148,112 @@ class _QueueTrackingScreenState extends State<QueueTrackingScreen>
           _arcController
             ..reset()
             ..forward();
+          return;
         }
-      });
-    } else {
-      // Fallback: simulate live queue updates every 30 seconds
-      _refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
-        if (!mounted) return;
-        setState(() {
-          if (_peopleAhead > 0) {
-            _peopleAhead = (_peopleAhead - 1).clamp(0, _totalQueue);
-            _waitMinutes = (_waitMinutes - 2).clamp(0, 999);
+
+        final ahead = token.peopleAhead;
+
+        // ── Status-based alerts ───────────────────────────────────────
+
+        // Your turn
+        if (token.status == 'called' &&
+            _prevTokenStatus != 'called' &&
+            !_turnAlertShown) {
+          _turnAlertShown = true;
+          _twoAheadShown = true;
+          _fiveAheadShown = true;
+          _earlyAlertShown = true;
+          AudioHelper.instance.playChimeTimes(3);
+          HapticFeedback.heavyImpact();
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _showTurnAlert();
+          });
+        }
+
+        // Marked absent
+        if (token.status == 'absent' &&
+            _prevTokenStatus != 'absent' &&
+            !_absentAlertShown) {
+          _absentAlertShown = true;
+          AudioHelper.instance.playChime();
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _showAbsentDialog();
+          });
+        }
+
+        // ── Position-change alerts (active tokens only) ───────────────
+
+        final posJumped =
+            token.tokenPosition > _prevTokenPosition + 2 &&
+            (token.status == 'active' || token.status == 'called');
+        final pushForward =
+            ahead == _prevPeopleAheadTrack + 1 &&
+            token.tokenPosition == _prevTokenPosition + 1 &&
+            (token.status == 'active' || token.status == 'called');
+
+        if (posJumped) {
+          // Skipped to back of queue
+          _showBanner(
+            'You\'ve been moved back in the queue. New position: ${token.tokenPosition}',
+            color: const Color(0xFF4F6BED),
+          );
+        } else if (pushForward) {
+          // Emergency patient inserted ahead
+          final waitEst = ahead * 4;
+          AudioHelper.instance.playChime();
+          _showBanner(
+            'A patient has been given emergency priority. '
+            'Your new position: ${token.tokenPosition}. '
+            'Estimated wait: ~$waitEst min',
+            color: const Color(0xFFD97706),
+          );
+        }
+
+        // ── Proximity alerts (most urgent first) ─────────────────────
+
+        if (token.status == 'active' || token.status == 'called') {
+          if (!_twoAheadShown && ahead <= 2) {
+            _twoAheadShown = true;
+            _fiveAheadShown = true;
+            _earlyAlertShown = true;
+            AudioHelper.instance.playChime();
+            _showBanner(
+              'You\'re almost up! Please be at the counter.',
+              color: const Color(0xFFEF4444),
+              persistent: true,
+            );
+          } else if (!_fiveAheadShown && ahead <= 5) {
+            _fiveAheadShown = true;
+            _earlyAlertShown = true;
+            final waitEst = ahead * 4;
+            AudioHelper.instance.playChime();
+            _showBanner(
+              '5 people ahead — approximately $waitEst minutes. Start heading back.',
+              color: const Color(0xFFD97706),
+            );
+          } else if (!_earlyAlertShown) {
+            final earlyThreshold =
+                (widget.initialPeopleAhead * 0.3).ceil();
+            if (widget.initialPeopleAhead > 10 &&
+                ahead <= earlyThreshold &&
+                ahead > 5) {
+              _earlyAlertShown = true;
+              final waitEst = ahead * 4;
+              _showBanner(
+                'You have some time — don\'t go too far (~$waitEst min remaining)',
+                color: const Color(0xFF4F6BED),
+              );
+            }
           }
+        }
+
+        _prevTokenStatus = token.status;
+        _prevTokenPosition = token.tokenPosition;
+        _prevPeopleAheadTrack = ahead;
+
+        setState(() {
+          _peopleAhead = ahead;
+          _waitMinutes = token.estimatedWaitMinutes;
           _secondsUntilRefresh = 30;
         });
         _arcController
@@ -122,10 +270,204 @@ class _QueueTrackingScreenState extends State<QueueTrackingScreen>
     });
   }
 
+  void _showBanner(
+    String message, {
+    required Color color,
+    bool persistent = false,
+  }) {
+    if (!mounted) return;
+    setState(() {
+      _bannerMessage = message;
+      _bannerColor = color;
+      _bannerPersistent = persistent;
+      _bannerVisible = true;
+    });
+    if (!persistent) {
+      Future.delayed(const Duration(seconds: 6), () {
+        if (mounted && !_bannerPersistent) {
+          setState(() => _bannerVisible = false);
+        }
+      });
+    }
+  }
+
+  void _showAbsentDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          padding: const EdgeInsets.all(28),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+                color: const Color(0xFFEF4444).withOpacity(0.3), width: 1),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.08),
+                blurRadius: 32,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: const Color(0xFFFEF2F2),
+                ),
+                child: const Icon(Icons.person_off_outlined,
+                    color: Color(0xFFEF4444), size: 30),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Marked Absent',
+                style: TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 20,
+                  fontWeight: FontWeight.w500,
+                  color: _textPrimary,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'You were marked absent. Please contact the OPD desk to rejoin the queue.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 13,
+                  color: _textSecondary,
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 24),
+              GestureDetector(
+                onTap: () => Navigator.pop(context),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    color: const Color(0xFFF3F4F6),
+                  ),
+                  child: const Center(
+                    child: Text(
+                      'Understood',
+                      style: TextStyle(
+                        fontFamily: 'Poppins',
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                        color: _textSecondary,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showTurnAlert() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          padding: const EdgeInsets.all(28),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+                color: _successGreen.withOpacity(0.3), width: 1),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.08),
+                blurRadius: 32,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _successGreen.withOpacity(0.1),
+                ),
+                child: const Icon(Icons.notifications_active_rounded,
+                    color: _successGreen, size: 32),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                "It's Your Turn!",
+                style: TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 20,
+                  fontWeight: FontWeight.w500,
+                  color: _textPrimary,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Token ${widget.tokenNumber} is now being called.\nPlease proceed to the counter.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 13,
+                  color: _textSecondary,
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 24),
+              GestureDetector(
+                onTap: () => Navigator.pop(context),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    color: _successGreen,
+                  ),
+                  child: const Center(
+                    child: Text(
+                      'I\'m here',
+                      style: TextStyle(
+                        fontFamily: 'Poppins',
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
+    // Re-enable global overlays now that this screen is leaving.
+    QueueNotificationService.instance.isQueueScreenActive = false;
     _tokenSubscription?.cancel();
-    _refreshTimer?.cancel();
+    _nowServingSubscription?.cancel();
+    _totalQueueSubscription?.cancel();
     _arcController.dispose();
     _pulseController.dispose();
     _countController.dispose();
@@ -144,393 +486,401 @@ class _QueueTrackingScreenState extends State<QueueTrackingScreen>
     final bottomPad = MediaQuery.of(context).padding.bottom;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0D1B2A),
-      body: Stack(
+      backgroundColor: _bgColor,
+      body: Column(
         children: [
-          // Background glows
-          Positioned(
-            top: -40,
-            right: -60,
-            child: Container(
-              width: 260,
-              height: 260,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: RadialGradient(
-                  colors: [
-                    const Color(0xFF00E5C8).withOpacity(0.09),
-                    Colors.transparent,
-                  ],
+          // ── Top bar ──────────────────────────────────────────────────
+          Padding(
+            padding: EdgeInsets.fromLTRB(20, topPad + 16, 20, 0),
+            child: Row(
+              children: [
+                GestureDetector(
+                  onTap: () => Navigator.pop(context),
+                  child: Container(
+                    width: 34,
+                    height: 34,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(10),
+                      color: const Color(0xFFF3F4F6),
+                    ),
+                    child: const Icon(
+                      Icons.arrow_back_ios_new_rounded,
+                      color: _textPrimary,
+                      size: 15,
+                    ),
+                  ),
                 ),
-              ),
-            ),
-          ),
-          Positioned(
-            bottom: 160,
-            left: -80,
-            child: Container(
-              width: 220,
-              height: 220,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: RadialGradient(
-                  colors: [
-                    const Color(0xFF0057FF).withOpacity(0.07),
-                    Colors.transparent,
-                  ],
-                ),
-              ),
-            ),
-          ),
-
-          Column(
-            children: [
-              // ── Top bar ─────────────────────────────────────────────
-              Padding(
-                padding: EdgeInsets.fromLTRB(20, topPad + 16, 20, 0),
-                child: Row(
+                const SizedBox(width: 14),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    GestureDetector(
-                      onTap: () => Navigator.pop(context),
-                      child: Container(
-                        width: 42,
-                        height: 42,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(13),
-                          color: const Color(0xFF152438),
-                          border: Border.all(
-                              color: const Color(0xFF1E3A52), width: 1),
-                        ),
-                        child: const Icon(Icons.arrow_back_ios_new_rounded,
-                            color: Colors.white, size: 16),
+                    const Text(
+                      'Queue status',
+                      style: TextStyle(
+                        fontFamily: 'Poppins',
+                        fontSize: 16,
+                        fontWeight: FontWeight.w500,
+                        color: _textPrimary,
                       ),
                     ),
-                    const SizedBox(width: 16),
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                    Text(
+                      widget.hospitalShort,
+                      style: const TextStyle(
+                        fontFamily: 'Poppins',
+                        fontSize: 11,
+                        color: _primaryBlue,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+                const Spacer(),
+                ScaleTransition(
+                  scale: _pulseAnimation,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(20),
+                      color: _selectedBg,
+                      border: Border.all(
+                          color: _primaryBlue.withOpacity(0.3), width: 0.5),
+                    ),
+                    child: Row(
                       children: [
-                        Text(
-                          'Queue Tracker',
-                          style: TextStyle(fontFamily: 'Poppins',
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700,
-                            color: Colors.white,
+                        Container(
+                          width: 6,
+                          height: 6,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _primaryBlue,
                           ),
                         ),
-                        Text(
-                          widget.hospitalShort,
-                          style: TextStyle(fontFamily: 'Poppins',
-                            fontSize: 12,
-                            color: const Color(0xFF00E5C8),
+                        const SizedBox(width: 5),
+                        const Text(
+                          'LIVE',
+                          style: TextStyle(
+                            fontFamily: 'Poppins',
+                            fontSize: 10,
                             fontWeight: FontWeight.w500,
+                            color: _primaryBlue,
+                            letterSpacing: 1,
                           ),
                         ),
                       ],
                     ),
-                    const Spacer(),
-                    // Live badge
-                    ScaleTransition(
-                      scale: _pulseAnimation,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 6),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(20),
-                          color:
-                              const Color(0xFF00E5C8).withOpacity(0.12),
-                          border: Border.all(
-                            color: const Color(0xFF00E5C8).withOpacity(0.35),
-                            width: 1,
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 6,
-                              height: 6,
-                              decoration: const BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: Color(0xFF00E5C8),
-                              ),
-                            ),
-                            const SizedBox(width: 5),
-                            Text(
-                              'LIVE',
-                              style: TextStyle(fontFamily: 'Poppins',
-                                fontSize: 10,
-                                fontWeight: FontWeight.w700,
-                                color: const Color(0xFF00E5C8),
-                                letterSpacing: 1.2,
-                              ),
-                            ),
-                          ],
-                        ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 16),
+
+          // ── Proximity / status alert banner ───────────────────────────
+          _ProximityBanner(
+            visible: _bannerVisible,
+            message: _bannerMessage ?? '',
+            color: _bannerColor,
+            persistent: _bannerPersistent,
+            onDismiss: () => setState(() => _bannerVisible = false),
+          ),
+
+          Expanded(
+            child: SingleChildScrollView(
+              physics: const BouncingScrollPhysics(),
+              padding: EdgeInsets.fromLTRB(20, 0, 20, bottomPad + 24),
+              child: Column(
+                children: [
+                  // ── Token hero card ───────────────────────────────────
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(18),
+                      gradient: const LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [_primaryBlue, _lightBlue],
                       ),
                     ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 28),
-
-              Expanded(
-                child: SingleChildScrollView(
-                  physics: const BouncingScrollPhysics(),
-                  padding: EdgeInsets.fromLTRB(20, 0, 20, bottomPad + 24),
-                  child: Column(
-                    children: [
-                      // ── Circular progress ────────────────────────────
-                      AnimatedBuilder(
-                        animation: _arcAnimation,
-                        builder: (_, __) => _CircularQueueIndicator(
-                          progress: _arcAnimation.value * _progress,
-                          peopleAhead: _peopleAhead,
-                          totalQueue: _totalQueue,
-                          tokenNumber: widget.tokenNumber,
-                        ),
-                      ),
-
-                      const SizedBox(height: 24),
-
-                      // ── Hospital + session ───────────────────────────
-                      Text(
-                        widget.hospitalFull,
-                        style: TextStyle(fontFamily: 'Poppins',
-                          fontSize: 15,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white,
-                        ),
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 6),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(20),
-                          color: Colors.white.withOpacity(0.05),
-                          border: Border.all(
-                            color: Colors.white.withOpacity(0.09),
-                            width: 1,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Positioned(
+                          top: -15,
+                          right: -15,
+                          child: Container(
+                            width: 80,
+                            height: 80,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.white.withOpacity(0.07),
+                            ),
                           ),
                         ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
+                        Positioned(
+                          bottom: -20,
+                          right: 30,
+                          child: Container(
+                            width: 60,
+                            height: 60,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.white.withOpacity(0.05),
+                            ),
+                          ),
+                        ),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Icon(widget.sessionIcon,
-                                size: 14,
-                                color: Colors.white.withOpacity(0.5)),
-                            const SizedBox(width: 6),
-                            Text(
-                              widget.session,
-                              style: TextStyle(fontFamily: 'Poppins',
-                                fontSize: 12.5,
-                                color: Colors.white.withOpacity(0.5),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-
-                      const SizedBox(height: 28),
-
-                      // ── Three stat cards ─────────────────────────────
-                      Row(
-                        children: [
-                          Expanded(
-                            child: _StatCard(
-                              icon: Icons.people_alt_rounded,
-                              label: 'People Ahead',
-                              value: '$_peopleAhead',
-                              valueColor: _peopleAhead <= 5
-                                  ? const Color(0xFF00E5C8)
-                                  : _peopleAhead <= 15
-                                      ? const Color(0xFFFFC107)
-                                      : const Color(0xFFFF6B6B),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: _StatCard(
-                              icon: Icons.schedule_rounded,
-                              label: 'Est. Wait',
-                              value: '~$_waitMinutes m',
-                              valueColor: Colors.white,
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: _StatCard(
-                              icon: Icons.confirmation_number_rounded,
-                              label: 'Your Position',
-                              value: '#$_yourPosition',
-                              valueColor: const Color(0xFF00E5C8),
-                            ),
-                          ),
-                        ],
-                      ),
-
-                      const SizedBox(height: 16),
-
-                      // ── Live update notice ───────────────────────────
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 13),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(14),
-                          color: const Color(0xFF152438),
-                          border: Border.all(
-                              color: const Color(0xFF1E3A52), width: 1),
-                        ),
-                        child: Row(
-                          children: [
-                            ScaleTransition(
-                              scale: _pulseAnimation,
-                              child: Container(
-                                width: 10,
-                                height: 10,
-                                decoration: const BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: Color(0xFF00E5C8),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Text(
-                                widget.tokenId != null
-                                    ? 'Listening for real-time updates'
-                                    : 'Queue updates every 30 seconds',
-                                style: TextStyle(fontFamily: 'Poppins',
-                                  fontSize: 13,
-                                  color: Colors.white.withOpacity(0.7),
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
-                            ),
-                            Text(
-                              widget.tokenId != null
-                                  ? 'LIVE'
-                                  : '${_secondsUntilRefresh}s',
-                              style: TextStyle(fontFamily: 'Poppins',
-                                fontSize: 12,
-                                color: const Color(0xFF00E5C8),
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-
-                      const SizedBox(height: 12),
-
-                      // ── Notification toggle card ──────────────────────
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 20, vertical: 18),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(18),
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [
-                              const Color(0xFF152438),
-                              const Color(0xFF0F1E30),
-                            ],
-                          ),
-                          border: Border.all(
-                            color: _notifyEnabled
-                                ? const Color(0xFF00E5C8).withOpacity(0.35)
-                                : const Color(0xFF1E3A52),
-                            width: 1,
-                          ),
-                          boxShadow: _notifyEnabled
-                              ? [
-                                  BoxShadow(
-                                    color: const Color(0xFF00E5C8)
-                                        .withOpacity(0.08),
-                                    blurRadius: 16,
-                                    offset: const Offset(0, 4),
-                                  )
-                                ]
-                              : null,
-                        ),
-                        child: Row(
-                          children: [
-                            AnimatedContainer(
-                              duration: const Duration(milliseconds: 250),
-                              width: 44,
-                              height: 44,
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(13),
-                                color: _notifyEnabled
-                                    ? const Color(0xFF00E5C8).withOpacity(0.15)
-                                    : Colors.white.withOpacity(0.05),
-                                border: Border.all(
-                                  color: _notifyEnabled
-                                      ? const Color(0xFF00E5C8).withOpacity(0.4)
-                                      : Colors.white.withOpacity(0.08),
-                                  width: 1,
-                                ),
-                              ),
-                              child: Icon(
-                                _notifyEnabled
-                                    ? Icons.notifications_active_rounded
-                                    : Icons.notifications_outlined,
-                                color: _notifyEnabled
-                                    ? const Color(0xFF00E5C8)
-                                    : Colors.white.withOpacity(0.35),
-                                size: 20,
-                              ),
-                            ),
-                            const SizedBox(width: 14),
                             Expanded(
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text(
-                                    'Notify me when 5 people ahead',
-                                    style: TextStyle(fontFamily: 'Poppins',
-                                      fontSize: 13.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: Colors.white,
+                                    'YOUR TOKEN',
+                                    style: TextStyle(
+                                      fontFamily: 'Poppins',
+                                      fontSize: 11,
+                                      color: Colors.white.withOpacity(0.7),
+                                      letterSpacing: 1.2,
                                     ),
                                   ),
-                                  const SizedBox(height: 2),
+                                  const SizedBox(height: 4),
                                   Text(
-                                    _notifyEnabled
-                                        ? 'You\'ll be alerted in time to arrive'
-                                        : 'Get notified before your turn',
-                                    style: TextStyle(fontFamily: 'Poppins',
-                                      fontSize: 11.5,
-                                      color: Colors.white.withOpacity(0.4),
+                                    widget.tokenNumber,
+                                    style: const TextStyle(
+                                      fontFamily: 'Poppins',
+                                      fontSize: 32,
+                                      fontWeight: FontWeight.w500,
+                                      color: Colors.white,
+                                      letterSpacing: 1,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Row(
+                                    children: [
+                                      const Icon(
+                                          Icons.local_hospital_outlined,
+                                          size: 12,
+                                          color: Colors.white70),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        widget.hospitalShort,
+                                        style: TextStyle(
+                                          fontFamily: 'Poppins',
+                                          fontSize: 11,
+                                          color: Colors.white.withOpacity(0.8),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      Icon(widget.sessionIcon,
+                                          size: 12, color: Colors.white70),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        widget.session.split(' ').first,
+                                        style: TextStyle(
+                                          fontFamily: 'Poppins',
+                                          fontSize: 11,
+                                          color: Colors.white.withOpacity(0.8),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                            // Now serving box
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 10),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(12),
+                                color: Colors.white.withOpacity(0.15),
+                              ),
+                              child: Column(
+                                children: [
+                                  Text(
+                                    'Now serving',
+                                    style: TextStyle(
+                                      fontFamily: 'Poppins',
+                                      fontSize: 10,
+                                      color: Colors.white.withOpacity(0.7),
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _nowServing ?? '---',
+                                    style: const TextStyle(
+                                      fontFamily: 'Poppins',
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w500,
+                                      color: Colors.white,
                                     ),
                                   ),
                                 ],
                               ),
                             ),
-                            const SizedBox(width: 10),
-                            _TealSwitch(
-                              value: _notifyEnabled,
-                              onChanged: (v) =>
-                                  setState(() => _notifyEnabled = v),
-                            ),
                           ],
                         ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // ── Circular progress ─────────────────────────────────
+                  AnimatedBuilder(
+                    animation: _arcAnimation,
+                    builder: (_, __) => _CircularQueueIndicator(
+                      progress: _arcAnimation.value * _progress,
+                      peopleAhead: _peopleAhead,
+                      totalQueue: _totalQueue,
+                      tokenNumber: widget.tokenNumber,
+                    ),
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // ── Stats grid (2 columns) ────────────────────────────
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _StatCard(
+                          icon: Icons.schedule_outlined,
+                          iconColor: const Color(0xFFD97706),
+                          value: '~$_waitMinutes',
+                          label: 'min wait',
+                        ),
                       ),
-
-                      const SizedBox(height: 12),
-
-                      // ── Queue position timeline ──────────────────────
-                      _QueueTimeline(
-                        peopleAhead: _peopleAhead,
-                        yourPosition: _yourPosition,
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _StatCard(
+                          icon: Icons.people_alt_outlined,
+                          iconColor: _primaryBlue,
+                          value: '$_totalQueue',
+                          label: 'total in queue',
+                        ),
                       ),
                     ],
                   ),
-                ),
+
+                  const SizedBox(height: 14),
+
+                  // ── Live update notice ────────────────────────────────
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 13),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                      border:
+                          Border.all(color: _borderColor, width: 0.5),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _primaryBlue,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Text(
+                            'Listening for real-time updates',
+                            style: TextStyle(
+                              fontFamily: 'Poppins',
+                              fontSize: 13,
+                              color: _textPrimary,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ),
+                        const Text(
+                          'LIVE',
+                          style: TextStyle(
+                            fontFamily: 'Poppins',
+                            fontSize: 12,
+                            color: _primaryBlue,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // ── Notification toggle ───────────────────────────────
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 16),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(
+                        color: _notifyEnabled
+                            ? _primaryBlue.withOpacity(0.3)
+                            : _borderColor,
+                        width: 0.5,
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 38,
+                          height: 38,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(11),
+                            color: _notifyEnabled
+                                ? _selectedBg
+                                : const Color(0xFFF3F4F6),
+                          ),
+                          child: Icon(
+                            _notifyEnabled
+                                ? Icons.notifications_active_outlined
+                                : Icons.notifications_outlined,
+                            color: _notifyEnabled
+                                ? _primaryBlue
+                                : _textSecondary,
+                            size: 18,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Text(
+                            'Notify me when it\'s my turn',
+                            style: TextStyle(
+                              fontFamily: 'Poppins',
+                              fontSize: 13,
+                              fontWeight: FontWeight.w500,
+                              color: _textPrimary,
+                            ),
+                          ),
+                        ),
+                        _BlueSwitch(
+                          value: _notifyEnabled,
+                          onChanged: (v) =>
+                              setState(() => _notifyEnabled = v),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // ── Queue position timeline ───────────────────────────
+                  _QueueTimeline(
+                    peopleAhead: _peopleAhead,
+                    yourPosition: _yourPosition,
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
         ],
       ),
@@ -538,7 +888,7 @@ class _QueueTrackingScreenState extends State<QueueTrackingScreen>
   }
 }
 
-// ── Circular queue indicator ──────────────────────────────────────────────────
+// ── Circular queue indicator ───────────────────────────────────────────────────
 
 class _CircularQueueIndicator extends StatelessWidget {
   final double progress;
@@ -556,77 +906,40 @@ class _CircularQueueIndicator extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 210,
-      height: 210,
+      width: 160,
+      height: 160,
       child: Stack(
         alignment: Alignment.center,
         children: [
-          // Outer glow ring
-          Container(
-            width: 210,
-            height: 210,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xFF00E5C8).withOpacity(0.10),
-                  blurRadius: 32,
-                  spreadRadius: 4,
-                ),
-              ],
-            ),
-          ),
-          // Track ring
           CustomPaint(
-            size: const Size(210, 210),
+            size: const Size(160, 160),
             painter: _ArcPainter(
               progress: progress,
-              trackColor: const Color(0xFF1E3A52),
-              arcColor: const Color(0xFF00E5C8),
-              strokeWidth: 12,
+              trackColor: const Color(0xFFE5E7EB),
+              arcColor: _primaryBlue,
+              strokeWidth: 10,
             ),
           ),
-          // Inner content
           Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                'Position',
-                style: TextStyle(fontFamily: 'Poppins',
-                  fontSize: 12,
-                  color: Colors.white.withOpacity(0.4),
-                ),
-              ),
-              const SizedBox(height: 4),
-              ShaderMask(
-                shaderCallback: (bounds) => const LinearGradient(
-                  colors: [Color(0xFF00E5C8), Color(0xFF00CFFF)],
-                ).createShader(bounds),
-                child: Text(
-                  tokenNumber,
-                  style: TextStyle(fontFamily: 'Poppins',
-                    fontSize: 28,
-                    fontWeight: FontWeight.w900,
-                    color: Colors.white,
-                    letterSpacing: 1,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '$peopleAhead of $totalQueue',
-                style: TextStyle(fontFamily: 'Poppins',
-                  fontSize: 13,
-                  color: Colors.white.withOpacity(0.55),
+                '$peopleAhead',
+                style: const TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 36,
                   fontWeight: FontWeight.w500,
+                  color: _textPrimary,
+                  height: 1,
                 ),
               ),
               const SizedBox(height: 2),
-              Text(
-                'ahead of you',
-                style: TextStyle(fontFamily: 'Poppins',
+              const Text(
+                'people ahead',
+                style: TextStyle(
+                  fontFamily: 'Poppins',
                   fontSize: 11,
-                  color: Colors.white.withOpacity(0.3),
+                  color: _textSecondary,
                 ),
               ),
             ],
@@ -654,8 +967,8 @@ class _ArcPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = (size.width - strokeWidth) / 2;
-    const startAngle = -2.356; // -135 degrees
-    const sweepTotal = 4.712;  // 270 degrees
+    const startAngle = -2.356;
+    const sweepTotal = 4.712;
 
     final trackPaint = Paint()
       ..color = trackColor
@@ -664,12 +977,7 @@ class _ArcPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
 
     final arcPaint = Paint()
-      ..shader = SweepGradient(
-        colors: const [Color(0xFF00E5C8), Color(0xFF00CFFF), Color(0xFF00E5C8)],
-        stops: const [0.0, 0.5, 1.0],
-        startAngle: startAngle,
-        endAngle: startAngle + sweepTotal,
-      ).createShader(Rect.fromCircle(center: center, radius: radius))
+      ..color = arcColor
       ..strokeWidth = strokeWidth
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
@@ -697,50 +1005,51 @@ class _ArcPainter extends CustomPainter {
   bool shouldRepaint(_ArcPainter old) => old.progress != progress;
 }
 
-// ── Stat card ─────────────────────────────────────────────────────────────────
+// ── Stat card ──────────────────────────────────────────────────────────────────
 
 class _StatCard extends StatelessWidget {
   final IconData icon;
-  final String label;
+  final Color iconColor;
   final String value;
-  final Color valueColor;
+  final String label;
 
   const _StatCard({
     required this.icon,
-    required this.label,
+    required this.iconColor,
     required this.value,
-    required this.valueColor,
+    required this.label,
   });
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 14),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        color: const Color(0xFF152438),
-        border: Border.all(color: const Color(0xFF1E3A52), width: 1),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _borderColor, width: 0.5),
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, size: 15, color: Colors.white.withOpacity(0.35)),
-          const SizedBox(height: 10),
+          Icon(icon, color: iconColor, size: 20),
+          const SizedBox(height: 8),
           Text(
             value,
-            style: TextStyle(fontFamily: 'Poppins',
-              fontSize: 16,
-              fontWeight: FontWeight.w800,
-              color: valueColor,
+            style: const TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: 22,
+              fontWeight: FontWeight.w500,
+              color: _textPrimary,
+              height: 1,
             ),
-            overflow: TextOverflow.ellipsis,
           ),
           const SizedBox(height: 2),
           Text(
             label,
-            style: TextStyle(fontFamily: 'Poppins',
-              fontSize: 10,
-              color: Colors.white.withOpacity(0.35),
+            style: const TextStyle(
+              fontFamily: 'Poppins',
+              fontSize: 11,
+              color: _textSecondary,
             ),
           ),
         ],
@@ -749,13 +1058,13 @@ class _StatCard extends StatelessWidget {
   }
 }
 
-// ── Teal custom switch ────────────────────────────────────────────────────────
+// ── Blue custom switch ────────────────────────────────────────────────────────
 
-class _TealSwitch extends StatelessWidget {
+class _BlueSwitch extends StatelessWidget {
   final bool value;
   final ValueChanged<bool> onChanged;
 
-  const _TealSwitch({required this.value, required this.onChanged});
+  const _BlueSwitch({required this.value, required this.onChanged});
 
   @override
   Widget build(BuildContext context) {
@@ -763,22 +1072,11 @@ class _TealSwitch extends StatelessWidget {
       onTap: () => onChanged(!value),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 250),
-        width: 48,
-        height: 27,
+        width: 44,
+        height: 24,
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
-          color: value
-              ? const Color(0xFF00E5C8)
-              : const Color(0xFF1E3A52),
-          boxShadow: value
-              ? [
-                  BoxShadow(
-                    color: const Color(0xFF00E5C8).withOpacity(0.35),
-                    blurRadius: 8,
-                    offset: const Offset(0, 2),
-                  )
-                ]
-              : null,
+          borderRadius: BorderRadius.circular(12),
+          color: value ? _primaryBlue : const Color(0xFFE5E7EB),
         ),
         child: AnimatedAlign(
           duration: const Duration(milliseconds: 250),
@@ -786,15 +1084,15 @@ class _TealSwitch extends StatelessWidget {
           alignment:
               value ? Alignment.centerRight : Alignment.centerLeft,
           child: Container(
-            width: 21,
-            height: 21,
+            width: 18,
+            height: 18,
             margin: const EdgeInsets.symmetric(horizontal: 3),
             decoration: const BoxDecoration(
               shape: BoxShape.circle,
               color: Colors.white,
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black26,
+                  color: Colors.black12,
                   blurRadius: 4,
                   offset: Offset(0, 1),
                 ),
@@ -820,50 +1118,49 @@ class _QueueTimeline extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Show at most 5 slots: last 2 served, your position, next 2 waiting
     final slots = <_TimelineSlot>[
       if (yourPosition > 2)
         _TimelineSlot(label: '#${yourPosition - 2}', state: _SlotState.served),
       if (yourPosition > 1)
         _TimelineSlot(label: '#${yourPosition - 1}', state: _SlotState.served),
       _TimelineSlot(label: '#$yourPosition', state: _SlotState.you),
-      _TimelineSlot(
-          label: '#${yourPosition + 1}', state: _SlotState.waiting),
-      _TimelineSlot(
-          label: '#${yourPosition + 2}', state: _SlotState.waiting),
+      _TimelineSlot(label: '#${yourPosition + 1}', state: _SlotState.waiting),
+      _TimelineSlot(label: '#${yourPosition + 2}', state: _SlotState.waiting),
     ];
 
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        color: const Color(0xFF152438),
-        border: Border.all(color: const Color(0xFF1E3A52), width: 1),
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _borderColor, width: 0.5),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Text(
-                'Queue Position',
-                style: TextStyle(fontFamily: 'Poppins',
-                  fontSize: 14,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white,
+              const Text(
+                'Queue position',
+                style: TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                  color: _textPrimary,
                 ),
               ),
               const Spacer(),
               Text(
                 '$peopleAhead people ahead',
-                style: TextStyle(fontFamily: 'Poppins',
-                  fontSize: 11.5,
-                  color: Colors.white.withOpacity(0.4),
+                style: const TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 11,
+                  color: _textSecondary,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 16),
           Row(
             children: slots.asMap().entries.map((e) {
               final isLast = e.key == slots.length - 1;
@@ -874,10 +1171,10 @@ class _QueueTimeline extends StatelessWidget {
                     if (!isLast)
                       Expanded(
                         child: Container(
-                          height: 2,
+                          height: 1.5,
                           color: e.value.state == _SlotState.served
-                              ? const Color(0xFF00E5C8).withOpacity(0.4)
-                              : const Color(0xFF1E3A52),
+                              ? _primaryBlue.withOpacity(0.35)
+                              : _borderColor,
                         ),
                       ),
                   ],
@@ -885,17 +1182,15 @@ class _QueueTimeline extends StatelessWidget {
               );
             }).toList(),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 14),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              _Legend(
-                  color: const Color(0xFF00E5C8), label: 'Served'),
-              const SizedBox(width: 20),
-              _Legend(color: const Color(0xFFFFC107), label: 'You'),
-              const SizedBox(width: 20),
-              _Legend(
-                  color: const Color(0xFF1E3A52), label: 'Waiting'),
+            children: const [
+              _Legend(color: _primaryBlue, label: 'Served'),
+              SizedBox(width: 18),
+              _Legend(color: Color(0xFFD97706), label: 'You'),
+              SizedBox(width: 18),
+              _Legend(color: Color(0xFFE5E7EB), label: 'Waiting'),
             ],
           ),
         ],
@@ -909,13 +1204,11 @@ enum _SlotState { served, you, waiting }
 class _TimelineSlot {
   final String label;
   final _SlotState state;
-
   const _TimelineSlot({required this.label, required this.state});
 }
 
 class _TimelineNode extends StatelessWidget {
   final _TimelineSlot slot;
-
   const _TimelineNode({required this.slot});
 
   @override
@@ -926,24 +1219,24 @@ class _TimelineNode extends StatelessWidget {
 
     switch (slot.state) {
       case _SlotState.served:
-        fill = const Color(0xFF00E5C8).withOpacity(0.15);
-        border = const Color(0xFF00E5C8).withOpacity(0.5);
-        textColor = const Color(0xFF00E5C8);
+        fill = _selectedBg;
+        border = _primaryBlue;
+        textColor = _primaryBlue;
       case _SlotState.you:
-        fill = const Color(0xFFFFC107).withOpacity(0.15);
-        border = const Color(0xFFFFC107);
-        textColor = const Color(0xFFFFC107);
+        fill = const Color(0xFFFEF3C7);
+        border = const Color(0xFFD97706);
+        textColor = const Color(0xFFD97706);
       case _SlotState.waiting:
         fill = Colors.transparent;
-        border = const Color(0xFF1E3A52);
-        textColor = Colors.white.withOpacity(0.3);
+        border = _borderColor;
+        textColor = _textSecondary;
     }
 
     return Column(
       children: [
         Container(
-          width: 36,
-          height: 36,
+          width: 32,
+          height: 32,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             color: fill,
@@ -951,16 +1244,17 @@ class _TimelineNode extends StatelessWidget {
           ),
           child: slot.state == _SlotState.served
               ? const Icon(Icons.check_rounded,
-                  size: 16, color: Color(0xFF00E5C8))
+                  size: 14, color: _primaryBlue)
               : null,
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: 5),
         Text(
           slot.state == _SlotState.you ? 'You' : slot.label,
-          style: TextStyle(fontFamily: 'Poppins',
+          style: TextStyle(
+            fontFamily: 'Poppins',
             fontSize: 10,
             fontWeight: slot.state == _SlotState.you
-                ? FontWeight.w700
+                ? FontWeight.w500
                 : FontWeight.w400,
             color: textColor,
           ),
@@ -973,7 +1267,6 @@ class _TimelineNode extends StatelessWidget {
 class _Legend extends StatelessWidget {
   final Color color;
   final String label;
-
   const _Legend({required this.color, required this.label});
 
   @override
@@ -981,19 +1274,79 @@ class _Legend extends StatelessWidget {
     return Row(
       children: [
         Container(
-          width: 10,
-          height: 10,
+          width: 8,
+          height: 8,
           decoration: BoxDecoration(shape: BoxShape.circle, color: color),
         ),
-        const SizedBox(width: 6),
+        const SizedBox(width: 5),
         Text(
           label,
-          style: TextStyle(fontFamily: 'Poppins',
-            fontSize: 11,
-            color: Colors.white.withOpacity(0.4),
+          style: const TextStyle(
+            fontFamily: 'Poppins',
+            fontSize: 10,
+            color: _textSecondary,
           ),
         ),
       ],
+    );
+  }
+}
+
+// ── Proximity alert banner ────────────────────────────────────────────────────
+
+class _ProximityBanner extends StatelessWidget {
+  final bool visible;
+  final String message;
+  final Color color;
+  final bool persistent;
+  final VoidCallback onDismiss;
+
+  const _ProximityBanner({
+    required this.visible,
+    required this.message,
+    required this.color,
+    required this.persistent,
+    required this.onDismiss,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 350),
+      curve: Curves.easeOutCubic,
+      height: visible ? 60.0 : 0.0,
+      clipBehavior: Clip.hardEdge,
+      decoration: BoxDecoration(color: color),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                message,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontFamily: 'Poppins',
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                  color: Colors.white,
+                  height: 1.35,
+                ),
+              ),
+            ),
+            if (!persistent)
+              GestureDetector(
+                onTap: onDismiss,
+                child: const Padding(
+                  padding: EdgeInsets.only(left: 12),
+                  child: Icon(Icons.close_rounded,
+                      color: Colors.white70, size: 18),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }
