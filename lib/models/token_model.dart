@@ -31,10 +31,9 @@ class TokenModel {
     required this.issuedAt,
   });
 
-  factory TokenModel.fromFirestore(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>;
+  factory TokenModel.fromMap(Map<String, dynamic> data, String id) {
     return TokenModel(
-      id: doc.id,
+      id: id,
       queueId: data['queue_id'] ?? '',
       userId: data['user_id'] ?? '',
       hospitalId: data['hospital_id'] ?? '',
@@ -46,8 +45,15 @@ class TokenModel {
       tokenPosition: data['token_position'] ?? 0,
       peopleAhead: data['people_ahead'] ?? 0,
       estimatedWaitMinutes: data['estimated_wait_minutes'] ?? 0,
-      issuedAt: (data['issued_at'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      issuedAt: data['issued_at'] as DateTime? ?? DateTime.now(),
     );
+  }
+
+  factory TokenModel.fromFirestore(DocumentSnapshot doc) {
+    final raw = Map<String, dynamic>.from(doc.data() as Map<String, dynamic>);
+    final ts = raw['issued_at'];
+    raw['issued_at'] = ts is Timestamp ? ts.toDate() : null;
+    return TokenModel.fromMap(raw, doc.id);
   }
 
   Map<String, dynamic> toFirestore() => {
