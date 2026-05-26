@@ -23,10 +23,9 @@ class Hospital {
     this.operatingHours = const {},
   });
 
-  factory Hospital.fromFirestore(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>;
+  factory Hospital.fromMap(Map<String, dynamic> data, String id) {
     return Hospital(
-      id: doc.id,
+      id: id,
       name: data['name'] ?? '',
       shortName: data['short_name'] ?? '',
       location: data['location'] ?? '',
@@ -37,6 +36,10 @@ class Hospital {
       operatingHours:
           Map<String, String>.from(data['operating_hours'] ?? {}),
     );
+  }
+
+  factory Hospital.fromFirestore(DocumentSnapshot doc) {
+    return Hospital.fromMap(doc.data() as Map<String, dynamic>, doc.id);
   }
 
   Map<String, dynamic> toFirestore() => {

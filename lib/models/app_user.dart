@@ -15,16 +15,21 @@ class AppUser {
     required this.createdAt,
   });
 
-  factory AppUser.fromFirestore(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>;
+  factory AppUser.fromMap(Map<String, dynamic> data, String id) {
     return AppUser(
-      uid: doc.id,
+      uid: id,
       name: data['name'] ?? '',
       phone: data['phone'] ?? '',
       role: data['role'] ?? 'patient',
-      createdAt:
-          (data['created_at'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      createdAt: data['created_at'] as DateTime? ?? DateTime.now(),
     );
+  }
+
+  factory AppUser.fromFirestore(DocumentSnapshot doc) {
+    final raw = Map<String, dynamic>.from(doc.data() as Map<String, dynamic>);
+    final ts = raw['created_at'];
+    raw['created_at'] = ts is Timestamp ? ts.toDate() : null;
+    return AppUser.fromMap(raw, doc.id);
   }
 
   Map<String, dynamic> toFirestore() => {

@@ -2,84 +2,60 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:noline_skip/models/app_user.dart';
 
 void main() {
-  final createdAt = DateTime(2024, 6, 1, 9, 0, 0);
+  final fixedDate = DateTime(2024, 6, 1, 9, 0, 0);
 
-  group('AppUser fields', () {
-    test('stores all fields correctly', () {
-      final user = AppUser(
-        uid: 'uid123',
-        name: 'Tenzin Wangchuk',
-        phone: '+97517123456',
-        role: 'patient',
-        createdAt: createdAt,
-      );
+  final fullMap = <String, dynamic>{
+    'name': 'Tenzin Wangchuk',
+    'phone': '+97517123456',
+    'role': 'patient',
+    'created_at': fixedDate,
+  };
 
-      expect(user.uid, 'uid123');
-      expect(user.name, 'Tenzin Wangchuk');
-      expect(user.phone, '+97517123456');
-      expect(user.role, 'patient');
-      expect(user.createdAt, createdAt);
-    });
+  group('AppUser.fromMap — full data', () {
+    late AppUser user;
 
-    test('default role is patient', () {
-      final user = AppUser(
-        uid: 'uid123',
-        name: 'Tenzin',
-        phone: '+97517123456',
-        createdAt: createdAt,
-      );
-      expect(user.role, 'patient');
-    });
+    setUpAll(() => user = AppUser.fromMap(fullMap, 'uid123'));
 
-    test('role can be staff', () {
-      final user = AppUser(
-        uid: 'uid456',
-        name: 'Dr. Karma',
-        phone: '+97517654321',
-        role: 'staff',
-        createdAt: createdAt,
-      );
+    test('parses uid from id argument', () => expect(user.uid, 'uid123'));
+    test('parses name', () => expect(user.name, 'Tenzin Wangchuk'));
+    test('parses phone', () => expect(user.phone, '+97517123456'));
+    test('parses role', () => expect(user.role, 'patient'));
+    test('parses created_at', () => expect(user.createdAt, fixedDate));
+  });
+
+  group('AppUser.fromMap — default values', () {
+    late AppUser user;
+
+    setUpAll(() => user = AppUser.fromMap({}, 'uid000'));
+
+    test('uid from argument', () => expect(user.uid, 'uid000'));
+    test('name defaults to empty string', () => expect(user.name, ''));
+    test('phone defaults to empty string', () => expect(user.phone, ''));
+    test('role defaults to patient', () => expect(user.role, 'patient'));
+    test('createdAt defaults to a non-null DateTime', () => expect(user.createdAt, isA<DateTime>()));
+  });
+
+  group('AppUser.fromMap — role variants', () {
+    test('staff role is preserved', () {
+      final user = AppUser.fromMap({...fullMap, 'role': 'staff'}, 'uid456');
       expect(user.role, 'staff');
+    });
+
+    test('missing role falls back to patient', () {
+      final map = Map<String, dynamic>.from(fullMap)..remove('role');
+      expect(AppUser.fromMap(map, 'uid789').role, 'patient');
     });
   });
 
   group('AppUser.toFirestore', () {
-    test('produces correct map keys and values', () {
-      final user = AppUser(
-        uid: 'uid123',
-        name: 'Tenzin Wangchuk',
-        phone: '+97517123456',
-        role: 'patient',
-        createdAt: createdAt,
-      );
+    late Map<String, dynamic> map;
 
-      final map = user.toFirestore();
+    setUpAll(() => map = AppUser.fromMap(fullMap, 'uid123').toFirestore());
 
-      expect(map['name'], 'Tenzin Wangchuk');
-      expect(map['phone'], '+97517123456');
-      expect(map['role'], 'patient');
-      expect(map.containsKey('created_at'), isTrue);
-    });
-
-    test('staff role is preserved in map', () {
-      final user = AppUser(
-        uid: 'uid456',
-        name: 'Dr. Karma',
-        phone: '+97517654321',
-        role: 'staff',
-        createdAt: createdAt,
-      );
-      expect(user.toFirestore()['role'], 'staff');
-    });
-
-    test('uid is not included in toFirestore output', () {
-      final user = AppUser(
-        uid: 'uid123',
-        name: 'Tenzin',
-        phone: '+975',
-        createdAt: createdAt,
-      );
-      expect(user.toFirestore().containsKey('uid'), isFalse);
-    });
+    test('contains name', () => expect(map['name'], 'Tenzin Wangchuk'));
+    test('contains phone', () => expect(map['phone'], '+97517123456'));
+    test('contains role', () => expect(map['role'], 'patient'));
+    test('contains created_at', () => expect(map.containsKey('created_at'), isTrue));
+    test('does not contain uid', () => expect(map.containsKey('uid'), isFalse));
   });
 }
