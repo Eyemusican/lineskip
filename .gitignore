@@ -53,8 +53,6 @@ android/app/google-services.json
 GoogleService-Info.plist
 ios/Runner/GoogleService-Info.plist
 .firebase/
-firebase.json
-.firebaserc
 web/firebase-config.js
 
 # Android signing
