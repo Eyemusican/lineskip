@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Scan for secrets
-        uses: trufflesecurity/trufflehog-actions-scan@main
+        uses: trufflesecurity/trufflehog@main
 
   analyze:
     runs-on: ubuntu-latest
