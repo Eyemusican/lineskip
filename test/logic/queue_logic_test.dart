@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:noline_skip/models/token_model.dart';
 
 // Pure business logic extracted from FirestoreService and QueueNotificationService.
 // These formulas are tested in isolation without any Firebase dependency.
@@ -22,6 +23,34 @@ bool shouldFireEarlyAlert({
   final threshold = earlyAlertThreshold(initialPeopleAhead);
   return currentAhead <= threshold && currentAhead > 5;
 }
+
+// Mirrors the auto-call logic inside markTokenStatus in FirestoreService.
+String? findNextTokenToCall(String servedTokenId, List<TokenModel> allTokens) {
+  final servedToken =
+      allTokens.where((t) => t.id == servedTokenId).firstOrNull;
+  if (servedToken == null) return null;
+  final candidates = allTokens
+      .where((t) =>
+          t.status == 'active' &&
+          t.queueId == servedToken.queueId &&
+          t.id != servedTokenId)
+      .toList()
+    ..sort((a, b) => a.tokenPosition.compareTo(b.tokenPosition));
+  return candidates.isEmpty ? null : candidates.first.id;
+}
+
+TokenModel _makeToken({
+  required String id,
+  required String queueId,
+  required String status,
+  required int tokenPosition,
+}) =>
+    TokenModel.fromMap({
+      'queue_id': queueId,
+      'status': status,
+      'token_position': tokenPosition,
+      'people_ahead': tokenPosition - 1,
+    }, id);
 
 void main() {
   group('Token number generation', () {
@@ -130,6 +159,67 @@ void main() {
         shouldFireEarlyAlert(initialPeopleAhead: 30, currentAhead: 9),
         isTrue,
       );
+    });
+  });
+
+  group('Auto-call next token after serve', () {
+    test('calls the next active token in the same queue', () {
+      final tokens = [
+        _makeToken(id: 'tok1', queueId: 'q1', status: 'called', tokenPosition: 1),
+        _makeToken(id: 'tok2', queueId: 'q1', status: 'active', tokenPosition: 2),
+        _makeToken(id: 'tok3', queueId: 'q1', status: 'active', tokenPosition: 3),
+      ];
+      expect(findNextTokenToCall('tok1', tokens), 'tok2');
+    });
+
+    test('returns null when no active tokens remain in the queue', () {
+      final tokens = [
+        _makeToken(id: 'tok1', queueId: 'q1', status: 'called', tokenPosition: 1),
+      ];
+      expect(findNextTokenToCall('tok1', tokens), isNull);
+    });
+
+    test('returns null when remaining tokens are all served or absent', () {
+      final tokens = [
+        _makeToken(id: 'tok1', queueId: 'q1', status: 'called', tokenPosition: 1),
+        _makeToken(id: 'tok2', queueId: 'q1', status: 'served', tokenPosition: 2),
+        _makeToken(id: 'tok3', queueId: 'q1', status: 'absent', tokenPosition: 3),
+      ];
+      expect(findNextTokenToCall('tok1', tokens), isNull);
+    });
+
+    test('picks the token with the lowest token_position regardless of list order', () {
+      final tokens = [
+        _makeToken(id: 'tok1', queueId: 'q1', status: 'called', tokenPosition: 1),
+        _makeToken(id: 'tok4', queueId: 'q1', status: 'active', tokenPosition: 4),
+        _makeToken(id: 'tok2', queueId: 'q1', status: 'active', tokenPosition: 2),
+        _makeToken(id: 'tok3', queueId: 'q1', status: 'active', tokenPosition: 3),
+      ];
+      expect(findNextTokenToCall('tok1', tokens), 'tok2');
+    });
+
+    test('does not call a token from a different queue', () {
+      final tokens = [
+        _makeToken(id: 'tok1', queueId: 'q1', status: 'called', tokenPosition: 1),
+        _makeToken(id: 'tok2', queueId: 'q2', status: 'active', tokenPosition: 1),
+      ];
+      expect(findNextTokenToCall('tok1', tokens), isNull);
+    });
+
+    test('does not call an already-called token, only active', () {
+      final tokens = [
+        _makeToken(id: 'tok1', queueId: 'q1', status: 'called', tokenPosition: 1),
+        _makeToken(id: 'tok2', queueId: 'q1', status: 'called', tokenPosition: 2),
+        _makeToken(id: 'tok3', queueId: 'q1', status: 'active', tokenPosition: 3),
+      ];
+      expect(findNextTokenToCall('tok1', tokens), 'tok3');
+    });
+
+    test('returns null when servedTokenId is not in the list', () {
+      final tokens = [
+        _makeToken(id: 'tok2', queueId: 'q1', status: 'active', tokenPosition: 2),
+      ];
+      expect(findNextTokenToCall('tok1', tokens), isNull);
     });
   });
 }

@@ -280,6 +280,26 @@ class FirestoreService {
     }
 
     await batch.commit();
+
+    // Auto-call the next waiting token in the same queue after serving
+    if (newStatus == 'served') {
+      final servedToken = allTokens.where((t) => t.id == tokenId).firstOrNull;
+      if (servedToken != null) {
+        final next = allTokens
+            .where((t) =>
+                t.status == 'active' &&
+                t.queueId == servedToken.queueId &&
+                t.id != tokenId)
+            .toList()
+          ..sort((a, b) => a.tokenPosition.compareTo(b.tokenPosition));
+        if (next.isNotEmpty) {
+          await _db
+              .collection('tokens')
+              .doc(next.first.id)
+              .update({'status': 'called'});
+        }
+      }
+    }
   }
 
   Future<void> skipToken(
