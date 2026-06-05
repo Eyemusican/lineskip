@@ -288,14 +288,17 @@ class FirestoreService {
         final next = allTokens
             .where((t) =>
                 t.status == 'active' &&
-                t.queueId == servedToken.queueId &&
-                t.id != tokenId)
+                (servedToken.queueId.isNotEmpty
+                    ? t.queueId == servedToken.queueId
+                    : t.hospitalId == servedToken.hospitalId &&
+                      t.session == servedToken.session))
             .toList()
           ..sort((a, b) => a.tokenPosition.compareTo(b.tokenPosition));
-        if (next.isNotEmpty) {
+        final nextToken = next.firstOrNull;
+        if (nextToken != null) {
           await _db
               .collection('tokens')
-              .doc(next.first.id)
+              .doc(nextToken.id)
               .update({'status': 'called'});
         }
       }

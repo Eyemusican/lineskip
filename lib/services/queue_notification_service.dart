@@ -21,6 +21,8 @@ class QueueNotificationService {
   bool _twoAheadShown = false;
   bool _absentAlertShown = false;
   bool _turnAlertShown = false;
+  bool _servedAlertShown = false;
+  bool _skippedAlertShown = false;
   int _prevTokenPosition = 0;
   int _prevPeopleAheadTrack = 0;
   String? _prevTokenStatus;
@@ -84,6 +86,8 @@ class QueueNotificationService {
     _twoAheadShown = false;
     _absentAlertShown = false;
     _turnAlertShown = false;
+    _servedAlertShown = false;
+    _skippedAlertShown = false;
     _prevTokenPosition = 0;
     _prevPeopleAheadTrack = 0;
     _prevTokenStatus = null;
@@ -133,6 +137,32 @@ class QueueNotificationService {
       if (!isQueueScreenActive) {
         AudioHelper.instance.playChime();
         _showGlobalDialog(const _AbsentDialog());
+      }
+    }
+
+    if (token.status == 'served' &&
+        _prevTokenStatus != 'served' &&
+        !_servedAlertShown) {
+      _servedAlertShown = true;
+      if (!isQueueScreenActive) {
+        AudioHelper.instance.playChime();
+        _showGlobalBanner(
+          '✅ Consultation complete. Thank you for using LineSkip!',
+          const Color(0xFF10B981),
+        );
+      }
+    }
+
+    if (token.status == 'skipped' &&
+        _prevTokenStatus != 'skipped' &&
+        !_skippedAlertShown) {
+      _skippedAlertShown = true;
+      if (!isQueueScreenActive) {
+        AudioHelper.instance.playChime();
+        _showGlobalBanner(
+          '⚠️ You were skipped. You have been moved to the end of the queue and will be called again soon.',
+          const Color(0xFFD97706),
+        );
       }
     }
 
