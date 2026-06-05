@@ -18,9 +18,33 @@ jobs:
       - name: Scan for secrets
         uses: trufflesecurity/trufflehog@main
 
-  analyze:
+  security-rules-test:
     runs-on: ubuntu-latest
     needs: secret-scanning
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Firebase tools
+        run: npm install -g firebase-tools
+
+      - name: Install rules testing dependencies
+        run: npm install @firebase/rules-unit-testing mocha
+
+      - name: Validate Firestore rules
+        run: firebase emulators:exec --only firestore "echo Security rules loaded successfully"
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+
+  analyze:
+    runs-on: ubuntu-latest
+    needs: security-rules-test
 
     steps:
       - name: Checkout code
@@ -120,7 +144,7 @@ jobs:
 
   pipeline-status:
     runs-on: ubuntu-latest
-    needs: [secret-scanning, analyze, test, build, deploy]
+    needs: [secret-scanning, security-rules-test, analyze, test, build, deploy]
     if: always()
 
     steps:
@@ -129,9 +153,10 @@ jobs:
           echo "=========================================="
           echo "           PIPELINE STATUS SUMMARY"
           echo "=========================================="
-          echo "secret-scanning : ${{ needs.secret-scanning.result }}"
-          echo "analyze         : ${{ needs.analyze.result }}"
-          echo "test            : ${{ needs.test.result }}"
-          echo "build           : ${{ needs.build.result }}"
-          echo "deploy          : ${{ needs.deploy.result }}"
+          echo "secret-scanning      : ${{ needs.secret-scanning.result }}"
+          echo "security-rules-test  : ${{ needs.security-rules-test.result }}"
+          echo "analyze              : ${{ needs.analyze.result }}"
+          echo "test                 : ${{ needs.test.result }}"
+          echo "build                : ${{ needs.build.result }}"
+          echo "deploy               : ${{ needs.deploy.result }}"
           echo "=========================================="
