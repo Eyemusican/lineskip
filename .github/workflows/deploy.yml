@@ -100,6 +100,20 @@ jobs:
           name: coverage-report
           path: coverage/lcov.info
 
+  coverage-report:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage
+
+      - name: Coverage report downloaded successfully
+        run: echo "Coverage report downloaded successfully"
+
   build:
     runs-on: ubuntu-latest
     needs: test
@@ -150,7 +164,7 @@ jobs:
 
   pipeline-status:
     runs-on: ubuntu-latest
-    needs: [secret-scanning, security-rules-test, analyze, test, build, deploy]
+    needs: [secret-scanning, security-rules-test, analyze, test, coverage-report, build, deploy]
     if: always()
 
     steps:
@@ -163,6 +177,7 @@ jobs:
           echo "security-rules-test  : ${{ needs.security-rules-test.result }}"
           echo "analyze              : ${{ needs.analyze.result }}"
           echo "test                 : ${{ needs.test.result }}"
+          echo "coverage-report      : ${{ needs.coverage-report.result }}"
           echo "build                : ${{ needs.build.result }}"
           echo "deploy               : ${{ needs.deploy.result }}"
           echo "=========================================="
