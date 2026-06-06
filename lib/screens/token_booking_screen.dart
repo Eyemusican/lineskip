@@ -167,11 +167,13 @@ class _TokenBookingScreenState extends State<TokenBookingScreen>
       if (mounted) _showSuccessSheet(tokenId, tokenNumber);
     } catch (e) {
       if (mounted) {
+        final message = e is DuplicateBookingException
+            ? 'You already have an active token today. Please track your existing token.'
+            : 'Booking failed. Please check your connection and try again.';
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-                'Booking failed. Please check your connection and try again.'),
-            backgroundColor: Color(0xFFEF4444),
+          SnackBar(
+            content: Text(message),
+            backgroundColor: const Color(0xFFEF4444),
           ),
         );
       }

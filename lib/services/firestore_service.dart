@@ -85,6 +85,7 @@ class FirestoreService {
   /// Books a token. Returns (tokenId, tokenNumber).
   /// Token number is sequential (OPD-001, OPD-002…).
   /// Position and wait time are calculated from live Firestore counts.
+  /// Throws [DuplicateBookingException] if the user already has an active token today.
   Future<(String tokenId, String tokenNumber)> bookToken({
     required String userId,
     required String hospitalId,
@@ -95,6 +96,19 @@ class FirestoreService {
   }) async {
     final today = DateTime.now();
     final dayStart = DateTime(today.year, today.month, today.day);
+
+    // Prevent duplicate booking — check for any active/called token today
+    final existingSnap = await _db
+        .collection('tokens')
+        .where('user_id', isEqualTo: userId)
+        .where('status', whereIn: ['active', 'called'])
+        .get();
+    for (final doc in existingSnap.docs) {
+      final issuedAt = (doc.data()['issued_at'] as Timestamp?)?.toDate();
+      if (issuedAt != null && !issuedAt.isBefore(dayStart)) {
+        throw const DuplicateBookingException();
+      }
+    }
     final dateStr =
         '${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}';
     final safeSession = session.replaceAll(' ', '_').toLowerCase();
@@ -352,4 +366,8 @@ class FirestoreService {
     });
     await batch.commit();
   }
+}
+
+class DuplicateBookingException implements Exception {
+  const DuplicateBookingException();
 }
